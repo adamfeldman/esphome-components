@@ -332,14 +332,23 @@ void CyberPowerProtocol::parse_battery_voltage_report(const HidReport &report, U
     return;
   }
 
-  // NUT debug shows: Report 0x0a, Offset 0, Size 8, Value: 24
-  // Current raw value: 0xF0 (240) should become 24V
-  // So scaling factor is 24/240 = 0.1 (divide by 10)
-  uint8_t voltage_raw = report.data[1];
-  data.battery.voltage = static_cast<float>(voltage_raw) / battery::VOLTAGE_SCALE_FACTOR; // Scale by 0.1
+  // CyberPower voltage fields are 9-bit (NUT cps-hid.c: CPS_VOLTAGE_LOGMAX = 511), so
+  // reading only report.data[1] truncates any value >= 256 decivolts (>= 25.6 V): a
+  // fully-charged 24 V pack floats near 27 V (270 decivolts = 0x010E) and the dropped
+  // high byte yields a bogus 1.4 V. Read the full 16-bit little-endian field when the
+  // report carries the high byte (as parse_input/output_voltage_report already do),
+  // falling back to the original single-byte read when it does not.
+  uint16_t voltage_raw = report.data[1];
+  if (report.data.size() >= 3) {
+    voltage_raw |= static_cast<uint16_t>(report.data[2]) << 8;
+  }
+  data.battery.voltage = static_cast<float>(voltage_raw) / battery::VOLTAGE_SCALE_FACTOR; // decivolts -> volts
   
-  ESP_LOGD(CP_TAG, "Battery voltage: %.1fV (raw: 0x%02X = %d)", 
-           data.battery.voltage, voltage_raw, voltage_raw);
+  // INFO (not DEBUG) so the on-wire report width is visible without raising the log level,
+  // to confirm truncation vs. a genuine 8-bit field. Drop back to ESP_LOGD once verified.
+  ESP_LOGI(CP_TAG, "Battery voltage: %.1fV (report size=%zu byte1=0x%02X byte2=0x%02X raw=%u)",
+           data.battery.voltage, report.data.size(), report.data[1],
+           (report.data.size() >= 3) ? report.data[2] : 0, voltage_raw);
 }
 
 void CyberPowerProtocol::parse_present_status_report(const HidReport &report, UpsData &data) {

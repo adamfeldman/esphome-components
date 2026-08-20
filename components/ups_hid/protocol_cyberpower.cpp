@@ -344,9 +344,11 @@ void CyberPowerProtocol::parse_battery_voltage_report(const HidReport &report, U
   }
   data.battery.voltage = static_cast<float>(voltage_raw) / battery::VOLTAGE_SCALE_FACTOR; // decivolts -> volts
   
-  // INFO (not DEBUG) so the on-wire report width is visible without raising the log level,
-  // to confirm truncation vs. a genuine 8-bit field. Drop back to ESP_LOGD once verified.
-  ESP_LOGI(CP_TAG, "Battery voltage: %.1fV (report size=%zu byte1=0x%02X byte2=0x%02X raw=%u)",
+  // VERIFIED on a CP1500AVRLCDa 2026-08-20: report size=3, byte1=0x0F byte2=0x01,
+  // raw=271 -> 27.1 V on a 24 V nominal pack. The high byte is genuinely present, so the
+  // old single-byte read was truncating (it saw 0x0F = 15 -> ~1.5 V). Kept at DEBUG now
+  // that the width is confirmed; raise to ESP_LOGI again if a new model reads implausibly.
+  ESP_LOGD(CP_TAG, "Battery voltage: %.1fV (report size=%zu byte1=0x%02X byte2=0x%02X raw=%u)",
            data.battery.voltage, report.data.size(), report.data[1],
            (report.data.size() >= 3) ? report.data[2] : 0, voltage_raw);
 }

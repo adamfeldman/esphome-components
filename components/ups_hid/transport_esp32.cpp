@@ -524,6 +524,125 @@ esp_err_t Esp32UsbTransport::find_and_open_device() {
     return ESP_OK;
 }
 
+esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_len,
+                                                   uint32_t timeout_ms) {
+    if (!device_.dev_hdl) {
+        set_last_error("USB device not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!data || !data_len || *data_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Prefer the length the device itself advertises. The HID class descriptor
+    // (bDescriptorType 0x21) sits inside the configuration descriptor right
+    // after our HID interface; its wDescriptorLength is the REPORT descriptor's
+    // true size. Asking for more than that can STALL on some devices, which we
+    // would then misread as "no descriptor".
+    uint16_t want = (uint16_t) *data_len;
+    const usb_config_desc_t *config_desc = nullptr;
+    if (usb_host_get_active_config_descriptor(device_.dev_hdl, &config_desc) == ESP_OK && config_desc) {
+        const uint8_t *p = (const uint8_t *) config_desc;
+        uint16_t total = config_desc->wTotalLength;
+        uint16_t i = 0;
+        while ((uint16_t)(i + 2) <= total) {
+            uint8_t bLength = p[i];
+            uint8_t bDescriptorType = p[i + 1];
+            if (bLength < 2) break;                       // malformed; stop walking
+            if (bDescriptorType == 0x21 && (uint16_t)(i + 9) <= total && p[i + 6] == 0x22) {
+                uint16_t rd_len = (uint16_t) p[i + 7] | ((uint16_t) p[i + 8] << 8);
+                ESP_LOGI(ESP32_USB_TAG, "HID descriptor advertises report descriptor length %u", rd_len);
+                if (rd_len > 0 && rd_len < want) want = rd_len;
+                break;
+            }
+            i = (uint16_t)(i + bLength);
+        }
+    } else {
+        ESP_LOGW(ESP32_USB_TAG, "No config descriptor; requesting %u bytes blind", want);
+    }
+
+    const uint8_t bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN |
+                                  USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                                  USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+    const uint8_t bRequest = USB_B_REQUEST_GET_DESCRIPTOR;
+    const uint16_t wValue = 0x2200;                       // REPORT descriptor, index 0
+    const uint16_t wIndex = device_.interface_num;
+
+    usb_transfer_t *transfer = nullptr;
+    size_t transfer_size = sizeof(usb_setup_packet_t) + want;
+    esp_err_t ret = usb_host_transfer_alloc(transfer_size, 0, &transfer);
+    if (ret != ESP_OK) {
+        set_last_error("Failed to allocate report-descriptor transfer");
+        return ret;
+    }
+
+    transfer->device_handle = device_.dev_hdl;
+    transfer->bEndpointAddress = 0;
+    transfer->num_bytes = transfer_size;
+    transfer->timeout_ms = timeout_ms;
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t*) transfer->data_buffer;
+    setup->bmRequestType = bmRequestType;
+    setup->bRequest = bRequest;
+    setup->wValue = wValue;
+    setup->wIndex = wIndex;
+    setup->wLength = want;
+
+    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
+    if (!done_sem) {
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
+
+    struct {
+        SemaphoreHandle_t sem;
+        esp_err_t result;
+        size_t actual_bytes;
+        int status;
+    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0, -1};
+
+    transfer->context = &ctx;
+    transfer->callback = [](usb_transfer_t *t) {
+        auto *c = static_cast<decltype(ctx)*>(t->context);
+        c->status = (int) t->status;
+        c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+        c->actual_bytes = t->actual_num_bytes;
+        xSemaphoreGive(c->sem);
+    };
+
+    ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
+    if (ret == ESP_OK) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+            // Report the RAW transfer status. hid_get_report() collapses this to
+            // ESP_FAIL, which is precisely why a STALL there is indistinguishable
+            // from a short read -- do not repeat that here.
+            ESP_LOGI(ESP32_USB_TAG, "GET_DESCRIPTOR(0x2200) usb_transfer_status=%d actual=%zu",
+                     ctx.status, ctx.actual_bytes);
+            ret = ctx.result;
+            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
+                size_t got = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+                size_t copy_len = (got < *data_len) ? got : *data_len;
+                memcpy(data, transfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+                *data_len = copy_len;
+            } else {
+                *data_len = 0;
+                if (ret == ESP_OK) ret = ESP_FAIL;        // completed, but empty
+            }
+        } else {
+            ESP_LOGW(ESP32_USB_TAG, "GET_DESCRIPTOR(0x2200) timed out");
+            *data_len = 0;
+            ret = ESP_ERR_TIMEOUT;
+        }
+    } else {
+        ESP_LOGW(ESP32_USB_TAG, "Failed to submit GET_DESCRIPTOR(0x2200): %s", esp_err_to_name(ret));
+        *data_len = 0;
+    }
+
+    vSemaphoreDelete(done_sem);
+    usb_host_transfer_free(transfer);
+    return ret;
+}
+
 esp_err_t Esp32UsbTransport::claim_interface() {
     const usb_config_desc_t *config_desc;
     esp_err_t ret = usb_host_get_active_config_descriptor(device_.dev_hdl, &config_desc);

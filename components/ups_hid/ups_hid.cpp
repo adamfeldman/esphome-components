@@ -38,6 +38,15 @@ void UpsHidComponent::update() {
     return;
   }
   
+  // ── cp825lcd-diagnostics ─────────────────────────────────────────────────
+  // Deliberately called from update(), NOT from setup() or handle_new_device().
+  // This component is setup_priority::DATA (600) and WiFi is 250, so anything
+  // logged during setup is emitted before the network exists and is
+  // unreachable over the API / web_server log streams. Measured across three
+  // restarts of device D while chasing the VID/PID line, which is emitted
+  // exactly there and never arrived. update() runs in the main loop.
+  run_hid_diagnostics_();
+
   // Check if protocol detection is needed
   if (!active_protocol_) {
     ESP_LOGI(TAG, log_messages::ATTEMPTING_DETECTION);
@@ -73,6 +82,88 @@ void UpsHidComponent::update() {
       active_protocol_.reset();  // Force protocol re-detection on next update
       consecutive_failures_ = 0;
     }
+  }
+}
+
+// ── cp825lcd-diagnostics ────────────────────────────────────────────────────
+// Everything here logs at ESP_LOGI on purpose: ESPHome bakes the log level into
+// the build (ESPHOME_LOG_LEVEL), so ESP_LOGD statements are COMPILED OUT on a
+// device running `logger: level: INFO` -- which device D is. A dump that is
+// compiled out is indistinguishable from a request that failed.
+void UpsHidComponent::run_hid_diagnostics_() {
+  static const char *HEXC = "0123456789ABCDEF";
+
+  // ---- (1) one-shot report-descriptor dump -------------------------------
+  if (!diag_descriptor_done_) {
+    diag_descriptor_done_ = true;
+    ESP_LOGI(TAG, "=== HID DIAGNOSTICS: VID=0x%04X PID=0x%04X ===",
+             transport_->get_vendor_id(), transport_->get_product_id());
+
+    std::vector<uint8_t> buf(512);
+    size_t len = buf.size();
+    esp_err_t ret = transport_->get_report_descriptor(buf.data(), &len, 2000);
+    if (ret != ESP_OK || len == 0) {
+      ESP_LOGE(TAG, "REPORT DESCRIPTOR READ FAILED: %s (len=%u)",
+               esp_err_to_name(ret), (unsigned) len);
+    } else {
+      ESP_LOGI(TAG, "REPORT DESCRIPTOR: %u bytes", (unsigned) len);
+      for (size_t i = 0; i < len; i += 16) {
+        std::string line;
+        for (size_t j = 0; j < 16 && (i + j) < len; j++) {
+          uint8_t v = buf[i + j];
+          line += HEXC[v >> 4];
+          line += HEXC[v & 0x0F];
+          line += ' ';
+        }
+        ESP_LOGI(TAG, "RD %03u: %s", (unsigned) i, line.c_str());
+      }
+      ESP_LOGI(TAG, "=== END REPORT DESCRIPTOR ===");
+    }
+  }
+
+  // ---- (2) chunked report-ID sweep, FEATURE *and* INPUT -------------------
+  // Chunked because the update loop is watchdog-exposed and the component
+  // already warns past 500 ms. Refusals measured at ~9-10 ms, so 8 ids x 2
+  // types is ~160 ms typical; the short per-request timeout bounds the bad
+  // case, since a request that TIMES OUT costs 5 s at the normal setting.
+  if (diag_sweep_done_) return;
+
+  const uint16_t SWEEP_LAST = 0x5F;   // covers CyberPower 0x07-0x1b and generic's 0x50
+  const uint16_t PER_TICK   = 8;
+  const uint32_t TMO_MS     = 150;
+
+  uint8_t buf[64];
+  uint16_t done_this_tick = 0;
+  while (diag_sweep_next_ <= SWEEP_LAST && done_this_tick < PER_TICK) {
+    uint8_t id = (uint8_t) diag_sweep_next_;
+    size_t l;
+
+    l = sizeof(buf);
+    if (transport_->hid_get_report(HID_REPORT_TYPE_FEATURE, id, buf, &l, TMO_MS) == ESP_OK && l > 0) {
+      diag_found_++;
+      ESP_LOGI(TAG, "SWEEP HIT  Feature 0x%02X  %u bytes", id, (unsigned) l);
+    }
+    l = sizeof(buf);
+    if (transport_->hid_get_report(HID_REPORT_TYPE_INPUT, id, buf, &l, TMO_MS) == ESP_OK && l > 0) {
+      diag_found_++;
+      ESP_LOGI(TAG, "SWEEP HIT  Input   0x%02X  %u bytes", id, (unsigned) l);
+    }
+
+    diag_sweep_next_++;
+    done_this_tick++;
+  }
+
+  if (diag_sweep_next_ > SWEEP_LAST) {
+    diag_sweep_done_ = true;
+    ESP_LOGI(TAG, "=== SWEEP COMPLETE: 0x00-0x%02X, %u hit(s) ===", SWEEP_LAST, diag_found_);
+    if (diag_found_ == 0) {
+      ESP_LOGI(TAG, "SWEEP: zero reports on the control pipe for BOTH types. "
+                    "Standard requests work (enumeration succeeded), so this is "
+                    "'no class GET_REPORT', not a dead control endpoint.");
+    }
+  } else {
+    ESP_LOGI(TAG, "SWEEP progress: next 0x%02X (%u hit(s) so far)",
+             (unsigned) diag_sweep_next_, diag_found_);
   }
 }
 

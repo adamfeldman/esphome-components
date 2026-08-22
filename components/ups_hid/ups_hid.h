@@ -177,6 +177,16 @@ namespace esphome
 
       // Clean architecture members
       std::unique_ptr<IUsbTransport> transport_;
+
+      // ── cp825lcd-diagnostics: one-shot HID descriptor dump + report-ID sweep ──
+      // Protocol-INDEPENDENT on purpose. enumerate_reports() lives in
+      // GenericHidProtocol::initialize(), so a device forced to protocol:
+      // cyberpower (as D is) would never reach it.
+      bool     diag_descriptor_done_{false};
+      bool     diag_sweep_done_{false};
+      uint16_t diag_sweep_next_{0};
+      uint16_t diag_found_{0};
+      void run_hid_diagnostics_();
       std::unique_ptr<UpsProtocolBase> active_protocol_;
       
       // Sensor storage (conditional on platform availability)

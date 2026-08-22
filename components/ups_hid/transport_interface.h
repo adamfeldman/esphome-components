@@ -41,6 +41,16 @@ public:
     // String descriptors
     virtual esp_err_t get_string_descriptor(uint8_t string_index, 
                                           std::string& result) = 0;
+
+    // HID REPORT descriptor -- standard GET_DESCRIPTOR, wValue 0x2200.
+    // Deliberately NOT pure virtual: a transport that cannot serve it (the
+    // simulation transport) then needs no change and cannot fail to build.
+    virtual esp_err_t get_report_descriptor(uint8_t* data, size_t* data_len,
+                                            uint32_t timeout_ms = 1000) {
+        (void) data; (void) timeout_ms;
+        if (data_len) *data_len = 0;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     
     // Error information
     virtual std::string get_last_error() const = 0;

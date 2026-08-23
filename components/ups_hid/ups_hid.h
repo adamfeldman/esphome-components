@@ -184,13 +184,13 @@ namespace esphome
       // cyberpower (as D is) would never reach it.
       bool     diag_descriptor_done_{false};
       uint16_t diag_tick_{0};        // update() ticks since boot; tick 0 is UNREACHABLE over the API
-      bool     diag_sweep_done_{false};
+      bool     diag_sweep_done_{true};   // E-exponent build: descriptor dump ONLY
       uint16_t diag_sweep_next_{0};
       uint16_t diag_found_{0};
-      bool     diag_wlen_done_{false};  // phase 2: the wLength 2x2 (see plan doc)
+      bool     diag_wlen_done_{true};   // E-exponent build: phase 2 disabled
       uint16_t diag_wlen_next_{0};
       uint16_t diag_wlen_hits_{0};
-      bool     diag_raw_done_{false};   // phase 3: raw bytes per report
+      bool     diag_raw_done_{true};    // E-exponent build: phase 3 disabled
       uint16_t diag_raw_next_{0};
       void run_hid_diagnostics_();
       void run_wlength_probe_();

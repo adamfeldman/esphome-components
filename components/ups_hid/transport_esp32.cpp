@@ -194,7 +194,13 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
             ret = ctx.result;
             if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
                 size_t data_received = ctx.actual_bytes - sizeof(usb_setup_packet_t);
-                size_t copy_len = std::min(data_received, *data_len);
+                // Bound by expected_len as well as by the caller's buffer. The
+                // transfer was allocated at sizeof(setup) + expected_len, and now
+                // that wLength is derived per report those are no longer the same
+                // number -- expected_len can be 2 while *data_len is 64. Bounding
+                // only by *data_len would read past the END OF THE TRANSFER if a
+                // device ever returns more than it was asked for.
+                size_t copy_len = std::min(std::min(data_received, *data_len), expected_len);
                 memcpy(data, transfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
                 *data_len = copy_len;
                 
@@ -582,12 +588,41 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
             if (bDescriptorType == 0x21 && (uint16_t)(i + 9) <= total && p[i + 6] == 0x22) {
                 uint16_t rd_len = (uint16_t) p[i + 7] | ((uint16_t) p[i + 8] << 8);
                 ESP_LOGD(ESP32_USB_TAG, "HID descriptor advertises report descriptor length %u", rd_len);
+                // ⛔ FAIL SAFE -- DO NOT SOFTEN THIS INTO A TRUNCATING READ.
+                // A descriptor bigger than the caller's buffer cannot be parsed
+                // correctly: the item walker stops mid-item, and every report
+                // still accumulating at the cut gets a PARTIAL, TOO-SMALL length.
+                // An under-asked wLength is not a soft failure. The device sends
+                // the whole report, the transfer buffer is short, and ESP-IDF's
+                // host-controller driver ABORTS FROM ITS OWN ISR -- __assert_func
+                // -> _buffer_parse, hcd_dwc.c -- with no error return and no
+                // recovery. MEASURED 2026-08-23 on a CyberPower CP1500AVRLCD3
+                // (0x0764:0x0601) whose descriptor is 726 bytes: it survived a
+                // 512-byte read only because the single report cut at the
+                // boundary happened to be one this driver never asks for.
+                // Refusing here costs nothing: the caller falls back to the
+                // legacy fixed length, which is exactly today's behaviour.
+                if (rd_len > (uint16_t) *data_len) {
+                    ESP_LOGW(ESP32_USB_TAG,
+                             "Report descriptor is %u bytes but the buffer holds %u -- refusing a "
+                             "truncated read; report lengths fall back to the legacy value.",
+                             rd_len, (unsigned) *data_len);
+                    *data_len = 0;
+                    return ESP_ERR_INVALID_SIZE;
+                }
                 if (rd_len > 0 && rd_len < want) want = rd_len;
                 break;
             }
             i = (uint16_t)(i + bLength);
         }
     } else {
+        // Blind path: we could not read the config descriptor, so we do not know
+        // the real length. Cap the ask at the historical 512 rather than letting
+        // it follow the caller's (now larger) buffer -- growing an unbounded
+        // request to a device that has already failed to describe itself is a
+        // behaviour change nobody asked for, and an over-long ask is exactly
+        // what some CyberPower firmware STALLs.
+        if (want > 512) want = 512;
         ESP_LOGW(ESP32_USB_TAG, "No config descriptor; requesting %u bytes blind", want);
     }
 
@@ -691,7 +726,11 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
 
     // static, not stack: this runs on the USB client task, whose stack is not
     // ours to spend 512 bytes of, and it is called once per connect.
-    static uint8_t desc[512];
+    // 1024, not 512: the largest descriptor measured on this fleet is 726 bytes
+    // (CP1500AVRLCD3), and a second unit sits at 510 -- two bytes under the old
+    // ceiling. Anything that still does not fit is REFUSED by
+    // get_report_descriptor() rather than truncated; see the fail-safe there.
+    static uint8_t desc[1024];
     size_t len = sizeof(desc);
     esp_err_t ret = get_report_descriptor(desc, &len, 2000);
     if (ret != ESP_OK || len == 0) {

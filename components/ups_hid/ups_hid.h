@@ -190,8 +190,11 @@ namespace esphome
       bool     diag_wlen_done_{false};  // phase 2: the wLength 2x2 (see plan doc)
       uint16_t diag_wlen_next_{0};
       uint16_t diag_wlen_hits_{0};
+      bool     diag_raw_done_{false};   // phase 3: raw bytes per report
+      uint16_t diag_raw_next_{0};
       void run_hid_diagnostics_();
       void run_wlength_probe_();
+      void run_raw_dump_();
       std::unique_ptr<UpsProtocolBase> active_protocol_;
       
       // Sensor storage (conditional on platform availability)

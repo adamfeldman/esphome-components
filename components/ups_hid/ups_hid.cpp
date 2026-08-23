@@ -215,7 +215,7 @@ void UpsHidComponent::run_hid_diagnostics_() {
 // GET only. Never SET: several CyberPower ids are commands when written (0x14
 // is the self-test). Reading 0x14 is what the driver already does every 10 s.
 void UpsHidComponent::run_wlength_probe_() {
-  if (diag_wlen_done_) return;
+  if (diag_wlen_done_) { run_raw_dump_(); return; }
 
   // Declared FEATURE payload per report id, parsed from this device's own
   // 383-byte report descriptor. 0x11 is not declared, hence absent.
@@ -269,6 +269,69 @@ void UpsHidComponent::run_wlength_probe_() {
   } else {
     ESP_LOGI(TAG, "WLEN progress: %u/%u ids (%u hit(s) so far)",
              (unsigned) diag_wlen_next_, (unsigned) N, diag_wlen_hits_);
+  }
+}
+
+// ── cp825lcd-diagnostics phase 3: RAW BYTES ─────────────────────────────────
+// Why this exists: D reports Battery Voltage 20.2 V on a 12 V pack while its
+// sibling E -- same 12 V / 450 W / 825 VA class, same parser -- reads 13.6 V
+// correctly. So the divide-by-10 is NOT wrong for 12 V packs, and D's value is
+// anomalous rather than mis-scaled. 20.2 implies a raw of 202 and 13.6 implies
+// 136; 202 is not a truncation of 136, so it is not a lost high byte either.
+//
+// Everything above is INFERRED from the rendered sensor value. This dumps what
+// the device actually returns, at two lengths, so the next step is grounded:
+//   payload+1  what the driver now asks for
+//   8          more than declared -- shows whether real data sits past the
+//              declared width (D answers any small length, arm B proved that)
+//
+// The controls are in the same output and are the point: 0x09 (battery nominal)
+// and 0x0E (input nominal) render CORRECTLY today, and sit next to 0x0A and
+// 0x0F which do not -- same width, same declared unit exponent (6 and 7
+// respectively). Whatever separates them is visible here or nowhere.
+//
+// GET only, never SET.
+void UpsHidComponent::run_raw_dump_() {
+  if (diag_raw_done_) return;
+  static const char *HEXC = "0123456789ABCDEF";
+
+  struct RepLen { uint8_t id; uint8_t payload; const char *what; };
+  static const RepLen R[] = {
+    {0x09,1,"battery nominal  CONTROL-ok"}, {0x0A,1,"battery actual   WRONG 20.2"},
+    {0x0E,1,"input nominal    CONTROL-ok"}, {0x0F,1,"input actual     WRONG 230"},
+    {0x10,2,"input transfer   NA"},         {0x12,1,"output voltage   NA"},
+    {0x13,1,"load pct         ok"},         {0x15,2,"delay shutdown   WRONG -16246"},
+    {0x07,6,"battery caps     ok"},         {0x08,5,"level+runtime    ok"},
+  };
+  const uint16_t N = sizeof(R) / sizeof(R[0]);
+  if (diag_raw_next_ >= N) {
+    diag_raw_done_ = true;
+    ESP_LOGI(TAG, "=== RAW DUMP COMPLETE ===");
+    return;
+  }
+
+  const RepLen &r = R[diag_raw_next_++];
+  uint8_t buf[64];
+  const uint16_t LENS[2] = { (uint16_t)(r.payload + 1), 8 };
+  for (uint8_t k = 0; k < 2; k++) {
+    size_t l = LENS[k];
+    esp_err_t ret = transport_->hid_get_report(HID_REPORT_TYPE_FEATURE, r.id, buf, &l, 300);
+    if (ret != ESP_OK || l == 0) {
+      ESP_LOGI(TAG, "RAW 0x%02X wLen=%u -> REFUSED (%s)  [%s]",
+               r.id, (unsigned) LENS[k], esp_err_to_name(ret), r.what);
+      continue;
+    }
+    std::string hex;
+    for (size_t j = 0; j < l && j < 16; j++) {
+      hex += HEXC[buf[j] >> 4]; hex += HEXC[buf[j] & 0x0F]; hex += ' ';
+    }
+    // Also render the two interpretations the parsers actually use, so the
+    // comparison does not need to be done by hand against a hex string.
+    unsigned b1 = (l > 1) ? buf[1] : 0;
+    unsigned le16 = (l > 2) ? (b1 | (buf[2] << 8)) : b1;
+    ESP_LOGI(TAG, "RAW 0x%02X wLen=%u -> %u B: %s | byte1=%u (/10=%.1f) le16=%u (/10=%.1f)  [%s]",
+             r.id, (unsigned) LENS[k], (unsigned) l, hex.c_str(),
+             b1, b1 / 10.0f, le16, le16 / 10.0f, r.what);
   }
 }
 

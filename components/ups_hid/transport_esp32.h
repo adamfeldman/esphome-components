@@ -44,6 +44,9 @@ public:
     
     esp_err_t get_string_descriptor(uint8_t string_index, 
                                   std::string& result) override;
+
+    esp_err_t get_report_descriptor(uint8_t* data, size_t* data_len,
+                                    uint32_t timeout_ms = 1000) override;
     
     std::string get_last_error() const override;
 
@@ -65,6 +68,16 @@ private:
     
     UsbDevice device_;
     mutable std::mutex device_mutex_;
+
+    // ── Declared report lengths, parsed from the device's own HID report
+    // descriptor at connect. Indexed [report_type][report_id]; the value is the
+    // PAYLOAD in bytes, so a request is payload + 1 for the leading report-id
+    // byte (NUT's rule, drivers/libhid.c:131). 0 means "not declared", which is
+    // the fail-safe path back to the legacy fixed length. Types are 1/2/3, so
+    // index 0 is unused and the array is deliberately [4].
+    uint8_t  report_payload_len_[4][256]{};
+    bool     report_lengths_known_{false};
+    bool     report_lengths_attempted_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> initialized_{false};
     
@@ -89,6 +102,7 @@ private:
     esp_err_t teardown_usb_host();
     esp_err_t find_and_open_device();
     esp_err_t claim_interface();
+    void parse_report_descriptor_lengths_();
     esp_err_t find_endpoints();
     
     void set_last_error(const std::string& error);

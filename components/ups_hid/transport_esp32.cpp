@@ -1,5 +1,6 @@
 #include "transport_esp32.h"
 #include "constants_ups.h"
+#include "constants_hid.h"   // HID_REPORT_TYPE_* -- used by the descriptor-length parser
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 
@@ -101,9 +102,38 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT: type=0x%02X, id=0x%02X, max_len=%zu", 
              report_type, report_id, *data_len);
     
-    // Use fixed buffer sizes like working implementation
-    uint8_t buffer[64] = {0}; // Fixed size buffer
-    size_t expected_len = std::min(*data_len, sizeof(buffer));
+    // Lazy, once per connect, on the CALLER's task -- never on the USB client
+    // task (see the note at connect: doing it there self-deadlocks).
+    if (!report_lengths_attempted_) {
+        report_lengths_attempted_ = true;
+        parse_report_descriptor_lengths_();
+    }
+
+    uint8_t buffer[64] = {0};
+
+    // ── wLength: the descriptor's declared length, NOT a fixed 64 ──────────
+    // MEASURED 2026-08-22 on a CyberPower CP825LCD (0x0764:0x0501): asking for
+    // 64 bytes of a report that is at most 6 bytes long is STALLed by that
+    // device's firmware -- 0/23 declared reports answered at wLength 64, and
+    // 23/23 answered at the declared length. Newer CP1500-generation firmware
+    // tolerates the over-long ask and short-reads, which is the only reason
+    // this defect stayed invisible. NUT has always sent the declared length
+    // (drivers/libhid.c:131, rbuf->len[id] = replen[id] + 1) and exposes
+    // over-long asks as an opt-IN knob (max_report_size), i.e. upstream treats
+    // exact-size as the default and 64-style asks as the exception.
+    //
+    // FAIL-SAFE: when the descriptor is missing, unparseable, or simply does
+    // not declare this report, fall back to the legacy fixed length. That is
+    // byte-for-byte today's behaviour, so a parse failure degrades to the
+    // status quo rather than breaking a device that works.
+    size_t want = *data_len;
+    if (report_lengths_known_ && report_type < 4) {
+        uint8_t declared = report_payload_len_[report_type][report_id];
+        if (declared > 0) {
+            want = (size_t) declared + 1;   // + the leading report-id byte
+        }
+    }
+    size_t expected_len = std::min(std::min(want, *data_len), sizeof(buffer));
     
     // Create USB control transfer for HID GET_REPORT
     const uint8_t bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | 
@@ -524,6 +554,214 @@ esp_err_t Esp32UsbTransport::find_and_open_device() {
     return ESP_OK;
 }
 
+esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_len,
+                                                   uint32_t timeout_ms) {
+    if (!device_.dev_hdl) {
+        set_last_error("USB device not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!data || !data_len || *data_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    // Prefer the length the device itself advertises. The HID class descriptor
+    // (bDescriptorType 0x21) sits inside the configuration descriptor right
+    // after our HID interface; its wDescriptorLength is the REPORT descriptor's
+    // true size. Asking for more than that can STALL on some devices, which we
+    // would then misread as "no descriptor".
+    uint16_t want = (uint16_t) *data_len;
+    const usb_config_desc_t *config_desc = nullptr;
+    if (usb_host_get_active_config_descriptor(device_.dev_hdl, &config_desc) == ESP_OK && config_desc) {
+        const uint8_t *p = (const uint8_t *) config_desc;
+        uint16_t total = config_desc->wTotalLength;
+        uint16_t i = 0;
+        while ((uint16_t)(i + 2) <= total) {
+            uint8_t bLength = p[i];
+            uint8_t bDescriptorType = p[i + 1];
+            if (bLength < 2) break;                       // malformed; stop walking
+            if (bDescriptorType == 0x21 && (uint16_t)(i + 9) <= total && p[i + 6] == 0x22) {
+                uint16_t rd_len = (uint16_t) p[i + 7] | ((uint16_t) p[i + 8] << 8);
+                ESP_LOGD(ESP32_USB_TAG, "HID descriptor advertises report descriptor length %u", rd_len);
+                if (rd_len > 0 && rd_len < want) want = rd_len;
+                break;
+            }
+            i = (uint16_t)(i + bLength);
+        }
+    } else {
+        ESP_LOGW(ESP32_USB_TAG, "No config descriptor; requesting %u bytes blind", want);
+    }
+
+    const uint8_t bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN |
+                                  USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                                  USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+    const uint8_t bRequest = USB_B_REQUEST_GET_DESCRIPTOR;
+    const uint16_t wValue = 0x2200;                       // REPORT descriptor, index 0
+    const uint16_t wIndex = device_.interface_num;
+
+    usb_transfer_t *transfer = nullptr;
+    size_t transfer_size = sizeof(usb_setup_packet_t) + want;
+    esp_err_t ret = usb_host_transfer_alloc(transfer_size, 0, &transfer);
+    if (ret != ESP_OK) {
+        set_last_error("Failed to allocate report-descriptor transfer");
+        return ret;
+    }
+
+    transfer->device_handle = device_.dev_hdl;
+    transfer->bEndpointAddress = 0;
+    transfer->num_bytes = transfer_size;
+    transfer->timeout_ms = timeout_ms;
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t*) transfer->data_buffer;
+    setup->bmRequestType = bmRequestType;
+    setup->bRequest = bRequest;
+    setup->wValue = wValue;
+    setup->wIndex = wIndex;
+    setup->wLength = want;
+
+    SemaphoreHandle_t done_sem = xSemaphoreCreateBinary();
+    if (!done_sem) {
+        usb_host_transfer_free(transfer);
+        return ESP_ERR_NO_MEM;
+    }
+
+    struct {
+        SemaphoreHandle_t sem;
+        esp_err_t result;
+        size_t actual_bytes;
+        int status;
+    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0, -1};
+
+    transfer->context = &ctx;
+    transfer->callback = [](usb_transfer_t *t) {
+        auto *c = static_cast<decltype(ctx)*>(t->context);
+        c->status = (int) t->status;
+        c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+        c->actual_bytes = t->actual_num_bytes;
+        xSemaphoreGive(c->sem);
+    };
+
+    ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
+    if (ret == ESP_OK) {
+        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+            // Report the RAW transfer status rather than collapsing it: a STALL
+            // and a short read are otherwise indistinguishable here.
+            ESP_LOGD(ESP32_USB_TAG, "GET_DESCRIPTOR(0x2200) usb_transfer_status=%d actual=%zu",
+                     ctx.status, ctx.actual_bytes);
+            ret = ctx.result;
+            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
+                size_t got = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+                size_t copy_len = (got < *data_len) ? got : *data_len;
+                memcpy(data, transfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
+                *data_len = copy_len;
+            } else {
+                *data_len = 0;
+                if (ret == ESP_OK) ret = ESP_FAIL;        // completed, but empty
+            }
+        } else {
+            ESP_LOGW(ESP32_USB_TAG, "GET_DESCRIPTOR(0x2200) timed out");
+            *data_len = 0;
+            ret = ESP_ERR_TIMEOUT;
+        }
+    } else {
+        ESP_LOGW(ESP32_USB_TAG, "Failed to submit GET_DESCRIPTOR(0x2200): %s", esp_err_to_name(ret));
+        *data_len = 0;
+    }
+
+    vSemaphoreDelete(done_sem);
+    usb_host_transfer_free(transfer);
+    return ret;
+}
+
+// Walk the HID report descriptor and record each report's declared PAYLOAD
+// length, so hid_get_report() can ask for exactly that many bytes.
+//
+// ⚠ Walk the ITEMS. Do NOT scan for an `85 xx` byte pair to find Report IDs:
+// `05 85` is Usage Page (Battery System) and collides with Report ID (0x85) on
+// a naive scan. That mistake produced a wrong offset for report 0x09 on the
+// CP825LCD descriptor within minutes of it being captured.
+//
+// Sizes ACCUMULATE: one report id can be built from several main items (0x08
+// on the CP825LCD is three), so each contributes report_size * report_count
+// bits to the same id.
+void Esp32UsbTransport::parse_report_descriptor_lengths_() {
+    report_lengths_known_ = false;
+    memset(report_payload_len_, 0, sizeof(report_payload_len_));
+    // NB: report_lengths_attempted_ is set by the CALLER before entry, so a
+    // genuine failure here does not re-attempt on every single request.
+
+    // static, not stack: this runs on the USB client task, whose stack is not
+    // ours to spend 512 bytes of, and it is called once per connect.
+    static uint8_t desc[512];
+    size_t len = sizeof(desc);
+    esp_err_t ret = get_report_descriptor(desc, &len, 2000);
+    if (ret != ESP_OK || len == 0) {
+        ESP_LOGW(ESP32_USB_TAG,
+                 "Report descriptor unavailable (%s, len=%u) -- hid_get_report falls back to "
+                 "the legacy fixed length. This is the status quo, not a new failure.",
+                 esp_err_to_name(ret), (unsigned) len);
+        return;
+    }
+
+    // bits[type][id], accumulated; converted to bytes at the end.
+    static uint32_t bits[4][256];
+    memset(bits, 0, sizeof(bits));
+
+    uint16_t rid = 0, rsize = 0, rcount = 0;
+    size_t i = 0;
+    while (i < len) {
+        uint8_t b = desc[i++];
+        if (b == 0xFE) {                      // long item: skip it wholesale
+            if (i >= len) break;
+            uint8_t datasize = desc[i];
+            i += 2 + datasize;
+            continue;
+        }
+        uint8_t sz = b & 0x03;
+        if (sz == 3) sz = 4;                  // 0b11 encodes 4 bytes, not 3
+        uint8_t type = (b >> 2) & 0x03;       // 0=Main 1=Global 2=Local
+        uint8_t tag  = b & 0xFC;
+        if (i + sz > len) break;              // truncated descriptor
+        uint32_t val = 0;
+        for (uint8_t k = 0; k < sz; k++) val |= ((uint32_t) desc[i + k]) << (8 * k);
+        i += sz;
+
+        if (type == 1) {                      // Global
+            if      (tag == 0x84) rid    = (uint16_t) val;   // Report ID
+            else if (tag == 0x74) rsize  = (uint16_t) val;   // Report Size (bits)
+            else if (tag == 0x94) rcount = (uint16_t) val;   // Report Count
+        } else if (type == 0) {               // Main
+            uint8_t rt = 0;
+            if      (tag == 0x80) rt = HID_REPORT_TYPE_INPUT;
+            else if (tag == 0x90) rt = HID_REPORT_TYPE_OUTPUT;
+            else if (tag == 0xB0) rt = HID_REPORT_TYPE_FEATURE;
+            if (rt != 0 && rid < 256) {
+                bits[rt][rid] += (uint32_t) rsize * (uint32_t) rcount;
+            }
+        }
+    }
+
+    uint16_t declared = 0;
+    for (uint8_t t = 1; t < 4; t++) {
+        for (uint16_t id = 0; id < 256; id++) {
+            if (bits[t][id] == 0) continue;
+            uint32_t nbytes = (bits[t][id] + 7) / 8;
+            if (nbytes > 255) nbytes = 255;   // cannot exceed the array's type
+            report_payload_len_[t][id] = (uint8_t) nbytes;
+            declared++;
+        }
+    }
+
+    report_lengths_known_ = (declared > 0);
+    ESP_LOGI(ESP32_USB_TAG,
+             "Report descriptor parsed: %u bytes, %u report(s) declared -- "
+             "hid_get_report will use each report's own length",
+             (unsigned) len, (unsigned) declared);
+    if (!report_lengths_known_) {
+        ESP_LOGW(ESP32_USB_TAG, "Descriptor parsed but declared NOTHING -- falling back to the "
+                                "legacy fixed length for every report.");
+    }
+}
+
 esp_err_t Esp32UsbTransport::claim_interface() {
     const usb_config_desc_t *config_desc;
     esp_err_t ret = usb_host_get_active_config_descriptor(device_.dev_hdl, &config_desc);
@@ -749,6 +987,19 @@ void Esp32UsbTransport::handle_new_device(uint8_t dev_addr) {
                 ret = find_endpoints();
                 if (ret == ESP_OK) {
                     connected_ = true;
+                    // ⛔ DO NOT parse the descriptor here. We are running INSIDE
+                    // usb_host_client_handle_events() -- handle_new_device() is
+                    // dispatched from it -- and get_report_descriptor() blocks on
+                    // a semaphore that only that same event loop can give. Calling
+                    // it here is a self-deadlock: the transfer cannot complete, it
+                    // times out, and every read silently falls back to the legacy
+                    // length. MEASURED 2026-08-22; the symptom is indistinguishable
+                    // from the fix simply not working, because the diagnostic it
+                    // logs is emitted before the API log subscription exists.
+                    // Arm it instead; hid_get_report() parses lazily on first use,
+                    // from the component's own task, where the read is proven.
+                    report_lengths_known_ = false;
+                    report_lengths_attempted_ = false;
                     ESP_LOGI(ESP32_USB_TAG, "UPS device successfully configured and ready");
                     return;
                 }

@@ -102,6 +102,13 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT: type=0x%02X, id=0x%02X, max_len=%zu", 
              report_type, report_id, *data_len);
     
+    // Lazy, once per connect, on the CALLER's task -- never on the USB client
+    // task (see the note at connect: doing it there self-deadlocks).
+    if (!report_lengths_attempted_) {
+        report_lengths_attempted_ = true;
+        parse_report_descriptor_lengths_();
+    }
+
     uint8_t buffer[64] = {0};
 
     // ── wLength: the descriptor's declared length, NOT a fixed 64 ──────────
@@ -680,6 +687,8 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
 void Esp32UsbTransport::parse_report_descriptor_lengths_() {
     report_lengths_known_ = false;
     memset(report_payload_len_, 0, sizeof(report_payload_len_));
+    // NB: report_lengths_attempted_ is set by the CALLER before entry, so a
+    // genuine failure here does not re-attempt on every single request.
 
     // static, not stack: this runs on the USB client task, whose stack is not
     // ours to spend 512 bytes of, and it is called once per connect.
@@ -979,9 +988,19 @@ void Esp32UsbTransport::handle_new_device(uint8_t dev_addr) {
                 ret = find_endpoints();
                 if (ret == ESP_OK) {
                     connected_ = true;
-                    // Must run AFTER connected_ = true: get_report_descriptor()
-                    // goes out over the control pipe like any other transfer.
-                    parse_report_descriptor_lengths_();
+                    // ⛔ DO NOT parse the descriptor here. We are running INSIDE
+                    // usb_host_client_handle_events() -- handle_new_device() is
+                    // dispatched from it -- and get_report_descriptor() blocks on
+                    // a semaphore that only that same event loop can give. Calling
+                    // it here is a self-deadlock: the transfer cannot complete, it
+                    // times out, and every read silently falls back to the legacy
+                    // length. MEASURED 2026-08-22; the symptom is indistinguishable
+                    // from the fix simply not working, because the diagnostic it
+                    // logs is emitted before the API log subscription exists.
+                    // Arm it instead; hid_get_report() parses lazily on first use,
+                    // from the component's own task, where the read is proven.
+                    report_lengths_known_ = false;
+                    report_lengths_attempted_ = false;
                     ESP_LOGI(ESP32_USB_TAG, "UPS device successfully configured and ready");
                     return;
                 }

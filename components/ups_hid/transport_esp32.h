@@ -77,6 +77,7 @@ private:
     // index 0 is unused and the array is deliberately [4].
     uint8_t  report_payload_len_[4][256]{};
     bool     report_lengths_known_{false};
+    bool     report_lengths_attempted_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> initialized_{false};
     

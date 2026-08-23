@@ -1,5 +1,6 @@
 #include "transport_esp32.h"
 #include "constants_ups.h"
+#include "constants_hid.h"   // HID_REPORT_TYPE_* -- used by the descriptor-length parser
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 

@@ -107,6 +107,13 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     // at connect: doing it there self-deadlocks). Retried, time-spaced.
     maybe_parse_report_descriptor_lengths_();
 
+    // DIAGNOSTIC ONLY. Delayed 20 s so the API log subscription exists -- output
+    // from the first update() cannot be captured over the network.
+    if (!ep0_probe_done_ && millis() > 20000) {
+        ep0_probe_done_ = true;
+        probe_ep0_cancel_();
+    }
+
     uint8_t buffer[64] = {0};
 
     // ── wLength: the descriptor's declared length, NOT a fixed 64 ──────────
@@ -718,6 +725,112 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
     vSemaphoreDelete(done_sem);
     usb_host_transfer_free(transfer);
     return ret;
+}
+
+// ─────────────────────────── DIAGNOSTIC ONLY ────────────────────────────────
+// Does EP0 (the default control pipe) support halt/flush/clear, and does a
+// FLUSHED transfer's callback actually fire?
+//
+// WHY THIS EXISTS. hid_get_report() and get_report_descriptor() both free their
+// transfer when the SEMAPHORE times out -- but ESP-IDF's usb_host_transfer_free()
+// says outright "The transfer must not be in-flight when attempting to free it",
+// and usb_transfer_t::timeout_ms is documented "currently not supported yet", so
+// a device that NAKs forever leaves the transfer genuinely in flight. The
+// correct fix is to CANCEL first, and the only cancellation ESP-IDF offers is
+// usb_host_endpoint_halt/flush/clear -- whose docs say the endpoint must be
+// "part of an interface claimed by a client". EP0 is not. So it may simply not
+// work here, and that decides which fix is even possible.
+//
+// HOW. Rather than only reading return codes, this submits a REAL control
+// transfer and waits just 1 ms, so the transfer is still genuinely in flight
+// when we cancel it (real reads take ~3-5 ms on this fleet). That exercises the
+// actual path: cancel an in-flight transfer, then see whether our callback runs.
+//
+// ⚠ If halt succeeds and clear fails, EP0 stays halted and the device needs a
+// reboot. clear() is therefore attempted unconditionally.
+void Esp32UsbTransport::probe_ep0_cancel_() {
+    ESP_LOGW(ESP32_USB_TAG, "=== EP0 CANCEL PROBE START (diagnostic build only) ===");
+
+    const uint8_t  REPORT_ID = 0x0F;      // known-good on this fleet, 3 bytes on C
+    const size_t   LEN       = 8;
+    usb_transfer_t *transfer = nullptr;
+    if (usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + LEN, 0, &transfer) != ESP_OK) {
+        ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: alloc failed; aborting");
+        return;
+    }
+    transfer->device_handle    = device_.dev_hdl;
+    transfer->bEndpointAddress = 0;
+    transfer->num_bytes        = sizeof(usb_setup_packet_t) + LEN;
+    transfer->timeout_ms       = 1000;    // ignored by ESP-IDF; set for symmetry
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t *) transfer->data_buffer;
+    setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_CLASS |
+                           USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+    setup->bRequest = 0x01;                                   // HID GET_REPORT
+    setup->wValue   = (HID_REPORT_TYPE_FEATURE << 8) | REPORT_ID;
+    setup->wIndex   = device_.interface_num;
+    setup->wLength  = LEN;
+
+    struct Ctx { SemaphoreHandle_t sem; volatile bool fired; volatile int status; };
+    SemaphoreHandle_t sem = xSemaphoreCreateBinary();
+    if (!sem) { usb_host_transfer_free(transfer); return; }
+    static Ctx ctx;                       // static: must outlive this frame if the
+    ctx = {sem, false, -1};               // callback fires late. That is the very
+                                          // bug being investigated -- do not copy
+                                          // this pattern into production code.
+    transfer->context  = &ctx;
+    transfer->callback = [](usb_transfer_t *t) {
+        auto *c = static_cast<Ctx *>(t->context);
+        c->status = (int) t->status;
+        c->fired  = true;
+        xSemaphoreGive(c->sem);
+    };
+
+    esp_err_t sub = usb_host_transfer_submit_control(device_.client_hdl, transfer);
+    ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: submit rc=%s", esp_err_to_name(sub));
+    if (sub != ESP_OK) { vSemaphoreDelete(sem); usb_host_transfer_free(transfer); return; }
+
+    bool early = (xSemaphoreTake(sem, pdMS_TO_TICKS(1)) == pdTRUE);
+    ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: after 1 ms -- callback fired already? %s",
+             early ? "YES (too fast; result is INCONCLUSIVE)" : "no (still in flight -- good)");
+
+    esp_err_t h = usb_host_endpoint_halt(device_.dev_hdl, 0);
+    ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: halt(ep0)  rc=%s", esp_err_to_name(h));
+    esp_err_t f = usb_host_endpoint_flush(device_.dev_hdl, 0);
+    ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: flush(ep0) rc=%s", esp_err_to_name(f));
+    esp_err_t c = usb_host_endpoint_clear(device_.dev_hdl, 0);
+    ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: clear(ep0) rc=%s", esp_err_to_name(c));
+
+    bool late = early || (xSemaphoreTake(sem, pdMS_TO_TICKS(1000)) == pdTRUE);
+    ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: callback fired=%s status=%d",
+             ctx.fired ? "YES" : "NO", ctx.status);
+
+    // VERDICT -- the whole point of the probe.
+    if (h == ESP_OK && f == ESP_OK && c == ESP_OK && ctx.fired && !early) {
+        ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE VERDICT: CANCELLATION WORKS on EP0 "
+                                "-- halt/flush/clear all OK and the callback ran. "
+                                "The correct UAF fix (cancel-then-free) is available.");
+    } else if (h != ESP_OK) {
+        ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE VERDICT: halt() REFUSED EP0 (%s) "
+                                "-- cancellation is NOT available; mitigation only.",
+                 esp_err_to_name(h));
+    } else if (!ctx.fired) {
+        ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE VERDICT: calls succeeded but the callback did NOT run "
+                                "-- flushing does not complete the transfer, so freeing is STILL "
+                                "unsafe. Mitigation only.");
+    } else {
+        ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE VERDICT: INCONCLUSIVE (transfer completed before we "
+                                "could cancel it). Re-run; consider a shorter wait.");
+    }
+
+    vSemaphoreDelete(sem);
+    if (late && ctx.fired) {
+        usb_host_transfer_free(transfer);  // safe: it completed
+    } else {
+        ESP_LOGW(ESP32_USB_TAG, "EP0 PROBE: LEAKING the transfer deliberately -- it may still be "
+                                "in flight and freeing it is exactly the bug under test.");
+    }
+    ESP_LOGW(ESP32_USB_TAG, "=== EP0 CANCEL PROBE END ===");
 }
 
 // Decide whether to (re)attempt the descriptor parse, and say so out loud.

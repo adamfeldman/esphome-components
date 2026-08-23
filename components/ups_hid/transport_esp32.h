@@ -127,6 +127,9 @@ private:
     esp_err_t claim_interface();
     void parse_report_descriptor_lengths_();
     void maybe_parse_report_descriptor_lengths_();
+    // DIAGNOSTIC ONLY -- never merge into the fix branch. See the .cpp.
+    void probe_ep0_cancel_();
+    bool ep0_probe_done_{false};
     esp_err_t find_endpoints();
     
     void set_last_error(const std::string& error);

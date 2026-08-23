@@ -183,6 +183,7 @@ namespace esphome
       // GenericHidProtocol::initialize(), so a device forced to protocol:
       // cyberpower (as D is) would never reach it.
       bool     diag_descriptor_done_{false};
+      uint16_t diag_tick_{0};        // update() ticks since boot; tick 0 is UNREACHABLE over the API
       bool     diag_sweep_done_{false};
       uint16_t diag_sweep_next_{0};
       uint16_t diag_found_{0};

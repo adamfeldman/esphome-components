@@ -93,8 +93,21 @@ void UpsHidComponent::update() {
 void UpsHidComponent::run_hid_diagnostics_() {
   static const char *HEXC = "0123456789ABCDEF";
 
-  // ---- (1) one-shot report-descriptor dump -------------------------------
-  if (!diag_descriptor_done_) {
+  diag_tick_++;
+
+  // ---- (1) report-descriptor dump ----------------------------------------
+  // ⛔ NOT one-shot, and NOT on the first tick. MEASURED 2026-08-22: the very
+  // first update() after a reboot is UNREACHABLE over the network -- the
+  // ESPHome API log SUBSCRIPTION is not live yet, so everything tick 1 emits
+  // is dropped, exactly as the boot banner is (setup_priority::DATA vs WiFi).
+  // Proof: two clean captures reconnected ~2 s after the OTA/restart
+  // disconnect and BOTH began mid-stream at "SWEEP progress: next 0x10" --
+  // tick 1's own progress line was missing too, so this is the subscription,
+  // not the dump. Firing on ticks 2-6 gives five independent chances, all
+  // after the subscription is provably live; it costs ~5 repeats of a short
+  // hex dump and it is what makes the result CAPTURABLE rather than merely
+  // emitted. Same family as the harness that discards a detector's findings.
+  if (diag_tick_ >= 2 && diag_tick_ <= 6) {
     diag_descriptor_done_ = true;
     ESP_LOGI(TAG, "=== HID DIAGNOSTICS: VID=0x%04X PID=0x%04X ===",
              transport_->get_vendor_id(), transport_->get_product_id());

@@ -46,7 +46,7 @@ void UpsHidComponent::update() {
       consecutive_failures_ = 0;
     } else {
       consecutive_failures_++;
-      ESP_LOGW(TAG, log_messages::DETECTION_FAILED, consecutive_failures_);
+      ESP_LOGW(TAG, log_messages::DETECTION_FAILED, (unsigned) consecutive_failures_);
       
       if (consecutive_failures_ > max_consecutive_failures_) {
         ESP_LOGE(TAG, log_messages::TOO_MANY_FAILURES);
@@ -66,7 +66,7 @@ void UpsHidComponent::update() {
     check_and_update_timers();
   } else {
     consecutive_failures_++;
-    ESP_LOGW(TAG, log_messages::READ_FAILED, consecutive_failures_);
+    ESP_LOGW(TAG, log_messages::READ_FAILED, (unsigned) consecutive_failures_);
     
     if (consecutive_failures_ > max_consecutive_failures_) {
       ESP_LOGW(TAG, log_messages::RESETTING_PROTOCOL);
@@ -587,7 +587,7 @@ bool UpsHidComponent::should_log_error(ErrorRateLimit& limiter) {
 void UpsHidComponent::log_suppressed_errors(ErrorRateLimit& limiter) {
   if (limiter.suppressed_count > 0) {
     ESP_LOGW(TAG, "Suppressed %u similar errors in the last %u ms", 
-             limiter.suppressed_count, ErrorRateLimit::RATE_LIMIT_MS);
+             (unsigned) limiter.suppressed_count, (unsigned) ErrorRateLimit::RATE_LIMIT_MS);
     limiter.suppressed_count = 0;
   }
 }

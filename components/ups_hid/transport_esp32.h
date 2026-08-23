@@ -127,6 +127,41 @@ private:
     esp_err_t claim_interface();
     void parse_report_descriptor_lengths_();
     void maybe_parse_report_descriptor_lengths_();
+
+    // ── Control-transfer completion context.
+    // HEAP-allocated, not a stack local, because a transfer we time out on is
+    // still IN FLIGHT: ESP-IDF cannot cancel it (usb_host_endpoint_halt/flush/
+    // clear all return ESP_ERR_INVALID_ARG for EP0 -- MEASURED 2026-08-23), and
+    // usb_host_transfer_free() states "The transfer must not be in-flight".
+    // So the transfer, its semaphore and this context are ABANDONED together
+    // and their lifetimes must not end with the calling frame.
+    struct TransferCtx {
+        SemaphoreHandle_t sem;
+        esp_err_t result;
+        size_t actual_bytes;
+        int status;
+    };
+
+    // Wait for completion WITHOUT starving the task watchdog. ESPHome subscribes
+    // its main loop task to the WDT (esp32/hal.cpp: esp_task_wdt_add(nullptr)),
+    // idle-task checking is off, and the WDT is 5 s with PANIC=y -- so a single
+    // xSemaphoreTake() longer than 5 s RESETS THE DEVICE. protocol_timeout's
+    // minimum clamp is exactly 5000 ms, so no configuration avoids it.
+    bool wait_for_transfer_(SemaphoreHandle_t sem, uint32_t timeout_ms);
+    bool leak_budget_exhausted_();
+
+    // Deliberately leak an un-cancellable in-flight transfer. See the .cpp.
+    void abandon_transfer_(usb_transfer_t *transfer, TransferCtx *ctx, size_t bytes,
+                           const char *what);
+
+    // Bounded in BYTES rather than in count, because the two paths leak very
+    // different amounts (a descriptor transfer is ~734 B, a report one ~72 B),
+    // and bytes are the quantity actually at risk. NOT reset on reconnect: a
+    // per-connection bound is re-armed by every re-enumeration, so a flapping
+    // device would leak without limit -- and these run for months on UPS power.
+    static constexpr uint32_t MAX_LEAKED_BYTES = 8192;
+    uint32_t leaked_bytes_{0};
+    bool     leak_cap_logged_{false};
     esp_err_t find_endpoints();
     
     void set_last_error(const std::string& error);

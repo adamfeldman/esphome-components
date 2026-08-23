@@ -4,6 +4,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/hal.h"    // millis() -- retry spacing for the descriptor parse
+#include "esphome/core/application.h"   // App.feed_wdt() -- see wait_for_transfer_()
 
 #ifdef USE_ESP32
 
@@ -99,6 +100,7 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
         ESP_LOGE(ESP32_USB_TAG, "HID GET_REPORT: Invalid parameters");
         return ESP_ERR_INVALID_ARG;
     }
+    if (leak_budget_exhausted_()) return ESP_ERR_INVALID_STATE;
 
     ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT: type=0x%02X, id=0x%02X, max_len=%zu", 
              report_type, report_id, *data_len);
@@ -186,27 +188,27 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
         return ESP_ERR_NO_MEM;
     }
     
-    // Simple context for completion
-    struct {
-        SemaphoreHandle_t sem;
-        esp_err_t result;
-        size_t actual_bytes;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0};
+    // HEAP-allocated: on timeout the transfer is still in flight, and this
+    // context, the semaphore and the transfer are ABANDONED together.
+    auto *ctx = new TransferCtx{done_sem, ESP_ERR_TIMEOUT, 0, -1};
     
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<TransferCtx *>(t->context);
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         c->actual_bytes = t->actual_num_bytes;
         xSemaphoreGive(c->sem);
     };
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
-    if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-            ret = ctx.result;
-            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
-                size_t data_received = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+    const bool submitted_ok = (ret == ESP_OK);
+    bool completed = false;
+    if (submitted_ok) {
+        completed = wait_for_transfer_(done_sem, timeout_ms);
+        if (completed) {
+            ret = ctx->result;
+            if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
+                size_t data_received = ctx->actual_bytes - sizeof(usb_setup_packet_t);
                 // Bound by expected_len as well as by the caller's buffer. The
                 // transfer was allocated at sizeof(setup) + expected_len, and now
                 // that wLength is derived per report those are no longer the same
@@ -231,8 +233,14 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
         ESP_LOGW(ESP32_USB_TAG, "Failed to submit HID GET_REPORT: %s", esp_err_to_name(ret));
     }
     
-    vSemaphoreDelete(done_sem);
-    usb_host_transfer_free(transfer);
+    if (submitted_ok && !completed) {
+        // In flight and un-cancellable. Leak deliberately; see abandon_transfer_().
+        abandon_transfer_(transfer, ctx, transfer_size, "HID GET_REPORT");
+    } else {
+        vSemaphoreDelete(done_sem);
+        delete ctx;
+        usb_host_transfer_free(transfer);
+    }
     return ret;
 }
 
@@ -247,6 +255,7 @@ esp_err_t Esp32UsbTransport::hid_set_report(uint8_t report_type, uint8_t report_
         ESP_LOGE(ESP32_USB_TAG, "HID SET_REPORT: Invalid parameters");
         return ESP_ERR_INVALID_ARG;
     }
+    if (leak_budget_exhausted_()) return ESP_ERR_INVALID_STATE;
 
     ESP_LOGD(ESP32_USB_TAG, "HID SET_REPORT: type=0x%02X, id=0x%02X, len=%zu", 
              report_type, report_id, data_len);
@@ -292,23 +301,24 @@ esp_err_t Esp32UsbTransport::hid_set_report(uint8_t report_type, uint8_t report_
         return ESP_ERR_NO_MEM;
     }
     
-    // Simple context for completion
-    struct {
-        SemaphoreHandle_t sem;
-        esp_err_t result;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT};
+    // HEAP-allocated: on timeout the transfer is still in flight, and this
+    // context, the semaphore and the transfer are ABANDONED together.
+    auto *ctx = new TransferCtx{done_sem, ESP_ERR_TIMEOUT, 0, -1};
     
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<TransferCtx *>(t->context);
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         xSemaphoreGive(c->sem);
     };
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
-    if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
-            ret = ctx.result;
+    const bool submitted_ok = (ret == ESP_OK);
+    bool completed = false;
+    if (submitted_ok) {
+        completed = wait_for_transfer_(done_sem, timeout_ms);
+        if (completed) {
+            ret = ctx->result;
             if (ret == ESP_OK) {
                 ESP_LOGD(ESP32_USB_TAG, "HID SET_REPORT success");
             } else {
@@ -322,13 +332,20 @@ esp_err_t Esp32UsbTransport::hid_set_report(uint8_t report_type, uint8_t report_
         ESP_LOGW(ESP32_USB_TAG, "Failed to submit HID SET_REPORT: %s", esp_err_to_name(ret));
     }
     
-    vSemaphoreDelete(done_sem);
-    usb_host_transfer_free(transfer);
+    if (submitted_ok && !completed) {
+        // In flight and un-cancellable. Leak deliberately; see abandon_transfer_().
+        abandon_transfer_(transfer, ctx, transfer_size, "HID SET_REPORT");
+    } else {
+        vSemaphoreDelete(done_sem);
+        delete ctx;
+        usb_host_transfer_free(transfer);
+    }
     return ret;
 }
 
 esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index, 
                                                  std::string& result) {
+    if (leak_budget_exhausted_()) return ESP_ERR_INVALID_STATE;
     result.clear();
     
     if (!device_.dev_hdl) {
@@ -380,29 +397,29 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
         return ESP_ERR_NO_MEM;
     }
     
-    // Context for completion
-    struct {
-        SemaphoreHandle_t sem;
-        esp_err_t result;
-        size_t actual_bytes;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0};
+    // HEAP-allocated: on timeout the transfer is still in flight, and this
+    // context, the semaphore and the transfer are ABANDONED together.
+    auto *ctx = new TransferCtx{done_sem, ESP_ERR_TIMEOUT, 0, -1};
     
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<TransferCtx *>(t->context);
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         c->actual_bytes = t->actual_num_bytes;
         xSemaphoreGive(c->sem);
     };
     
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
-    if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timing::USB_SEMAPHORE_TIMEOUT_MS)) == pdTRUE) {
-            ret = ctx.result;
-            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
+    const bool submitted_ok = (ret == ESP_OK);
+    bool completed = false;
+    if (submitted_ok) {
+        completed = wait_for_transfer_(done_sem, timing::USB_SEMAPHORE_TIMEOUT_MS);
+        if (completed) {
+            ret = ctx->result;
+            if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
                 // Parse the USB string descriptor
                 uint8_t *desc_data = transfer->data_buffer + sizeof(usb_setup_packet_t);
-                size_t desc_len = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+                size_t desc_len = ctx->actual_bytes - sizeof(usb_setup_packet_t);
                 
                 if (desc_len >= 2) {
                     uint8_t bLength = desc_data[0];        // Total length of descriptor
@@ -452,8 +469,14 @@ esp_err_t Esp32UsbTransport::get_string_descriptor(uint8_t string_index,
         ESP_LOGW(ESP32_USB_TAG, "Failed to submit string descriptor request: %s", esp_err_to_name(ret));
     }
     
-    vSemaphoreDelete(done_sem);
-    usb_host_transfer_free(transfer);
+    if (submitted_ok && !completed) {
+        // In flight and un-cancellable. Leak deliberately; see abandon_transfer_().
+        abandon_transfer_(transfer, ctx, transfer_size, "GET_DESCRIPTOR(string)");
+    } else {
+        vSemaphoreDelete(done_sem);
+        delete ctx;
+        usb_host_transfer_free(transfer);
+    }
     return ret;
 }
 
@@ -575,6 +598,7 @@ esp_err_t Esp32UsbTransport::find_and_open_device() {
 
 esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_len,
                                                    uint32_t timeout_ms) {
+    if (leak_budget_exhausted_()) return ESP_ERR_INVALID_STATE;
     if (!device_.dev_hdl) {
         set_last_error("USB device not ready");
         return ESP_ERR_INVALID_STATE;
@@ -672,16 +696,13 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
         return ESP_ERR_NO_MEM;
     }
 
-    struct {
-        SemaphoreHandle_t sem;
-        esp_err_t result;
-        size_t actual_bytes;
-        int status;
-    } ctx = {done_sem, ESP_ERR_TIMEOUT, 0, -1};
+    // HEAP-allocated: on timeout the transfer is still in flight, and this
+    // context, the semaphore and the transfer are ABANDONED together.
+    auto *ctx = new TransferCtx{done_sem, ESP_ERR_TIMEOUT, 0, -1};
 
-    transfer->context = &ctx;
+    transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
-        auto *c = static_cast<decltype(ctx)*>(t->context);
+        auto *c = static_cast<TransferCtx *>(t->context);
         c->status = (int) t->status;
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         c->actual_bytes = t->actual_num_bytes;
@@ -689,15 +710,18 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
     };
 
     ret = usb_host_transfer_submit_control(device_.client_hdl, transfer);
-    if (ret == ESP_OK) {
-        if (xSemaphoreTake(done_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+    const bool submitted_ok = (ret == ESP_OK);
+    bool completed = false;
+    if (submitted_ok) {
+        completed = wait_for_transfer_(done_sem, timeout_ms);
+        if (completed) {
             // Report the RAW transfer status rather than collapsing it: a STALL
             // and a short read are otherwise indistinguishable here.
             ESP_LOGD(ESP32_USB_TAG, "GET_DESCRIPTOR(0x2200) usb_transfer_status=%d actual=%zu",
-                     ctx.status, ctx.actual_bytes);
-            ret = ctx.result;
-            if (ret == ESP_OK && ctx.actual_bytes > sizeof(usb_setup_packet_t)) {
-                size_t got = ctx.actual_bytes - sizeof(usb_setup_packet_t);
+                     ctx->status, ctx->actual_bytes);
+            ret = ctx->result;
+            if (ret == ESP_OK && ctx->actual_bytes > sizeof(usb_setup_packet_t)) {
+                size_t got = ctx->actual_bytes - sizeof(usb_setup_packet_t);
                 size_t copy_len = (got < *data_len) ? got : *data_len;
                 memcpy(data, transfer->data_buffer + sizeof(usb_setup_packet_t), copy_len);
                 *data_len = copy_len;
@@ -715,9 +739,86 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
         *data_len = 0;
     }
 
-    vSemaphoreDelete(done_sem);
-    usb_host_transfer_free(transfer);
+    if (submitted_ok && !completed) {
+        // In flight and un-cancellable. Leak deliberately; see abandon_transfer_().
+        abandon_transfer_(transfer, ctx, transfer_size, "GET_DESCRIPTOR(0x2200)");
+    } else {
+        vSemaphoreDelete(done_sem);
+        delete ctx;
+        usb_host_transfer_free(transfer);
+    }
     return ret;
+}
+
+// Have we leaked our budget? Once exhausted we stop submitting altogether: the
+// device is not answering anyway, and continuing would leak without bound on a
+// node that may run for months on UPS power. Reads then fail loudly, which is
+// the honest report -- the UPS genuinely is not responding.
+bool Esp32UsbTransport::leak_budget_exhausted_() {
+    if (leaked_bytes_ < MAX_LEAKED_BYTES) return false;
+    if (!leak_cap_logged_) {
+        leak_cap_logged_ = true;
+        ESP_LOGE(ESP32_USB_TAG,
+                 "Abandoned %u bytes of un-cancellable USB transfers (budget %u). Refusing further "
+                 "control transfers for this boot. The device has stopped answering; freeing an "
+                 "in-flight transfer is undefined behaviour and EP0 cannot be cancelled.",
+                 (unsigned) leaked_bytes_, (unsigned) MAX_LEAKED_BYTES);
+    }
+    return true;
+}
+
+// Wait for a control transfer to complete without starving the task watchdog.
+//
+// ⛔ DO NOT COLLAPSE THIS BACK INTO A SINGLE xSemaphoreTake(timeout_ms).
+// ESPHome subscribes its MAIN LOOP TASK to the ESP-IDF task watchdog
+// (components/esp32/hal.cpp: esp_task_wdt_add(nullptr)); the generated sdkconfig
+// disables idle-task checking, so the loop task is the watched one; and the
+// watchdog is CONFIG_ESP_TASK_WDT_TIMEOUT_S=5 with CONFIG_ESP_TASK_WDT_PANIC=y.
+// A blocked task feeds nothing, so any single wait longer than 5 s PANICS AND
+// REBOOTS THE DEVICE. set_protocol_timeout() clamps to a 5000 ms MINIMUM, i.e.
+// exactly the watchdog period -- there is no configuration that avoids this.
+// Feeding in slices keeps the full timeout semantics and removes the reset.
+//
+// ⚠ Consequence worth knowing: a wedged device now makes this node UNRESPONSIVE
+// for up to protocol_timeout instead of REBOOTING it. That is the better trade
+// (a reboot loses state and fixes nothing) but it is a behaviour change. The
+// genuinely correct answer is to stop blocking the loop at all and make these
+// reads asynchronous, which is an architecture change, not a patch.
+bool Esp32UsbTransport::wait_for_transfer_(SemaphoreHandle_t sem, uint32_t timeout_ms) {
+    const uint32_t SLICE_MS = 100;
+    uint32_t waited = 0;
+    while (waited < timeout_ms) {
+        uint32_t remaining = timeout_ms - waited;
+        uint32_t slice = (remaining < SLICE_MS) ? remaining : SLICE_MS;
+        if (xSemaphoreTake(sem, pdMS_TO_TICKS(slice)) == pdTRUE) return true;
+        waited += slice;
+        App.feed_wdt();
+    }
+    return false;
+}
+
+// Abandon an in-flight transfer we can no longer wait for -- deliberately
+// leaking the transfer, its semaphore and its context TOGETHER.
+//
+// ⛔ THIS IS NOT A BUG AND MUST NOT BE "TIDIED" INTO A free()/delete().
+// usb_host_transfer_free() states "The transfer must not be in-flight when
+// attempting to free it", and usb_transfer_t::timeout_ms is "currently not
+// supported yet" -- so the stack never times a transfer out itself and a device
+// that NAKs forever leaves ours genuinely queued. Cancelling is not an option:
+// usb_host_endpoint_{halt,flush,clear} ALL return ESP_ERR_INVALID_ARG for
+// endpoint 0 (MEASURED 2026-08-23 on a live device, with a successful submit on
+// the same handle in the same function as the control). Freeing would let a
+// later callback run against freed heap, write a RETURNED STACK FRAME and give
+// a DELETED semaphore. Leaking is strictly the lesser evil, and it is bounded.
+void Esp32UsbTransport::abandon_transfer_(usb_transfer_t *transfer, TransferCtx *ctx,
+                                          size_t bytes, const char *what) {
+    (void) transfer; (void) ctx;               // intentionally not freed
+    leaked_bytes_ += (uint32_t) bytes;
+    ESP_LOGW(ESP32_USB_TAG,
+             "%s timed out and CANNOT be cancelled on EP0 -- abandoning %u bytes "
+             "(%u of %u budget). This is deliberate; freeing an in-flight transfer "
+             "is undefined behaviour.",
+             what, (unsigned) bytes, (unsigned) leaked_bytes_, (unsigned) MAX_LEAKED_BYTES);
 }
 
 // Decide whether to (re)attempt the descriptor parse, and say so out loud.
@@ -782,6 +883,12 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
     static uint8_t desc[1024];
     size_t len = sizeof(desc);
     esp_err_t ret = get_report_descriptor(desc, &len, 2000);
+    if (ret == ESP_ERR_TIMEOUT) {
+        // A timeout means we ABANDONED a transfer (it cannot be cancelled). Retrying
+        // would leak again, and a device that does not answer a descriptor request in
+        // 2 s is not going to answer the next one either. Burn the remaining attempts.
+        report_lengths_attempts_ = REPORT_LENGTH_MAX_ATTEMPTS;
+    }
     if (ret != ESP_OK || len == 0) {
         ESP_LOGW(ESP32_USB_TAG,
                  "Report descriptor unavailable (%s, len=%u) -- hid_get_report falls back to "

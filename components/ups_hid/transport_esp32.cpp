@@ -3,6 +3,7 @@
 #include "constants_hid.h"   // HID_REPORT_TYPE_* -- used by the descriptor-length parser
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/hal.h"    // millis() -- retry spacing for the descriptor parse
 
 #ifdef USE_ESP32
 
@@ -102,12 +103,9 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT: type=0x%02X, id=0x%02X, max_len=%zu", 
              report_type, report_id, *data_len);
     
-    // Lazy, once per connect, on the CALLER's task -- never on the USB client
-    // task (see the note at connect: doing it there self-deadlocks).
-    if (!report_lengths_attempted_) {
-        report_lengths_attempted_ = true;
-        parse_report_descriptor_lengths_();
-    }
+    // Lazy, on the CALLER's task -- never on the USB client task (see the note
+    // at connect: doing it there self-deadlocks). Retried, time-spaced.
+    maybe_parse_report_descriptor_lengths_();
 
     uint8_t buffer[64] = {0};
 
@@ -131,6 +129,21 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
         uint8_t declared = report_payload_len_[report_type][report_id];
         if (declared > 0) {
             want = (size_t) declared + 1;   // + the leading report-id byte
+            // One-shot POSITIVE confirmation that the fix is actually engaged,
+            // deliberately DELAYED past the first poll. Everything the parse
+            // logs happens inside the first update(), which cannot be captured
+            // over the network -- so "working" and "silently inert" look
+            // identical in any log you can take. Holding this line until a
+            // later poll guarantees it is capturable. Without it the only
+            // positive evidence is a DEBUG-level max_len that is not 64.
+            if (!report_lengths_confirmed_logged_ &&
+                (uint32_t)(millis() - report_lengths_known_at_ms_) >= REPORT_LENGTH_CONFIRM_DELAY_MS) {
+                report_lengths_confirmed_logged_ = true;
+                ESP_LOGI(ESP32_USB_TAG,
+                         "Descriptor-derived report lengths are IN USE (e.g. type=0x%02X id=0x%02X "
+                         "-> wLength %u, not the legacy %u).",
+                         report_type, report_id, (unsigned) want, (unsigned) *data_len);
+            }
         }
     }
     size_t expected_len = std::min(std::min(want, *data_len), sizeof(buffer));
@@ -707,6 +720,42 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
     return ret;
 }
 
+// Decide whether to (re)attempt the descriptor parse, and say so out loud.
+//
+// Bounded and TIME-SPACED. See the header for why per-call retries would be
+// worse than the single latched attempt this replaces.
+void Esp32UsbTransport::maybe_parse_report_descriptor_lengths_() {
+    if (report_lengths_known_) return;
+
+    if (report_lengths_attempts_ >= REPORT_LENGTH_MAX_ATTEMPTS) {
+        // Log ONCE. By construction this lands on a later poll, so unlike the
+        // parse's own output it can actually be captured over the network.
+        if (!report_lengths_exhausted_logged_) {
+            report_lengths_exhausted_logged_ = true;
+            ESP_LOGW(ESP32_USB_TAG,
+                     "Report-descriptor parse failed %u times; giving up for this connection. "
+                     "Every read falls back to the legacy fixed length -- that is the pre-fix "
+                     "behaviour, not a new failure, but per-report sizing is NOT in effect.",
+                     (unsigned) report_lengths_attempts_);
+        }
+        return;
+    }
+
+    uint32_t now = millis();
+    if (report_lengths_attempts_ > 0 &&
+        (uint32_t)(now - report_lengths_last_attempt_ms_) < REPORT_LENGTH_RETRY_MS) {
+        return;
+    }
+
+    report_lengths_last_attempt_ms_ = now;
+    report_lengths_attempts_++;
+    if (report_lengths_attempts_ > 1) {
+        ESP_LOGI(ESP32_USB_TAG, "Retrying report-descriptor parse (attempt %u of %u)",
+                 (unsigned) report_lengths_attempts_, (unsigned) REPORT_LENGTH_MAX_ATTEMPTS);
+    }
+    parse_report_descriptor_lengths_();
+}
+
 // Walk the HID report descriptor and record each report's declared PAYLOAD
 // length, so hid_get_report() can ask for exactly that many bytes.
 //
@@ -721,8 +770,8 @@ esp_err_t Esp32UsbTransport::get_report_descriptor(uint8_t* data, size_t* data_l
 void Esp32UsbTransport::parse_report_descriptor_lengths_() {
     report_lengths_known_ = false;
     memset(report_payload_len_, 0, sizeof(report_payload_len_));
-    // NB: report_lengths_attempted_ is set by the CALLER before entry, so a
-    // genuine failure here does not re-attempt on every single request.
+    // NB: attempt accounting and retry spacing belong to
+    // maybe_parse_report_descriptor_lengths_(), which is the ONLY caller.
 
     // static, not stack: this runs on the USB client task, whose stack is not
     // ours to spend 512 bytes of, and it is called once per connect.
@@ -791,6 +840,7 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
     }
 
     report_lengths_known_ = (declared > 0);
+    if (report_lengths_known_) report_lengths_known_at_ms_ = millis();
     ESP_LOGI(ESP32_USB_TAG,
              "Report descriptor parsed: %u bytes, %u report(s) declared -- "
              "hid_get_report will use each report's own length",
@@ -1038,7 +1088,11 @@ void Esp32UsbTransport::handle_new_device(uint8_t dev_addr) {
                     // Arm it instead; hid_get_report() parses lazily on first use,
                     // from the component's own task, where the read is proven.
                     report_lengths_known_ = false;
-                    report_lengths_attempted_ = false;
+                    report_lengths_attempts_ = 0;
+                    report_lengths_last_attempt_ms_ = 0;
+                    report_lengths_known_at_ms_ = 0;
+                    report_lengths_exhausted_logged_ = false;
+                    report_lengths_confirmed_logged_ = false;
                     ESP_LOGI(ESP32_USB_TAG, "UPS device successfully configured and ready");
                     return;
                 }

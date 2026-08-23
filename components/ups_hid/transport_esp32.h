@@ -77,7 +77,30 @@ private:
     // index 0 is unused and the array is deliberately [4].
     uint8_t  report_payload_len_[4][256]{};
     bool     report_lengths_known_{false};
-    bool     report_lengths_attempted_{false};
+
+    // ── Parse scheduling. The parse used to be a single latched attempt, which
+    // made ONE transient failure permanent for the whole boot -- and silent,
+    // because the attempt happens inside the first update(), whose log output
+    // cannot be captured over the network (the API subscription is not live
+    // yet). A device could therefore run with the fix doing nothing at all and
+    // look identical to one where it worked. MEASURED 2026-08-23 on a
+    // CP1500AVRLCD3: every production read still asked the legacy 64.
+    // Retries are TIME-SPACED, not per-call: hid_get_report() is called ~29
+    // times per poll and a failed parse blocks for up to 2 s, so retrying on
+    // each call would burn every attempt inside the first poll and block the
+    // main loop for ~6 s. Spacing them puts attempts 2+ on later polls, which
+    // is also what makes their outcome capturable at all.
+    static constexpr uint8_t  REPORT_LENGTH_MAX_ATTEMPTS = 3;
+    static constexpr uint32_t REPORT_LENGTH_RETRY_MS = 5000;
+    // Separate constant on purpose: this one only delays a LOG line past the
+    // first (uncapturable) poll. Sharing the retry interval would mean tuning
+    // the retry silently changed what you can observe.
+    static constexpr uint32_t REPORT_LENGTH_CONFIRM_DELAY_MS = 5000;
+    uint8_t  report_lengths_attempts_{0};
+    uint32_t report_lengths_last_attempt_ms_{0};
+    uint32_t report_lengths_known_at_ms_{0};
+    bool     report_lengths_exhausted_logged_{false};
+    bool     report_lengths_confirmed_logged_{false};
     std::atomic<bool> connected_{false};
     std::atomic<bool> initialized_{false};
     
@@ -103,6 +126,7 @@ private:
     esp_err_t find_and_open_device();
     esp_err_t claim_interface();
     void parse_report_descriptor_lengths_();
+    void maybe_parse_report_descriptor_lengths_();
     esp_err_t find_endpoints();
     
     void set_last_error(const std::string& error);

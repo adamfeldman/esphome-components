@@ -139,9 +139,16 @@ void UpsHidComponent::run_hid_diagnostics_() {
   // already warns past 500 ms. Refusals measured at ~9-10 ms, so 8 ids x 2
   // types is ~160 ms typical; the short per-request timeout bounds the bad
   // case, since a request that TIMES OUT costs 5 s at the normal setting.
-  if (diag_sweep_done_) return;
+  // Phase 2 runs only once the 0x00-0x5F sweep has finished, so the two never
+  // share a tick and their results can never be confused for one another.
+  if (diag_sweep_done_) { run_wlength_probe_(); return; }
 
-  const uint16_t SWEEP_LAST = 0x5F;   // covers CyberPower 0x07-0x1b and generic's 0x50
+  // NARROWED 0x5F -> 0x18 now that the wide sweep has already returned its clean
+  // zero. Its job here is different and better: 0x01-0x18 is exactly the set the
+  // wLength probe below tests, so this run is the CONTROL ARM for that 2x2 --
+  // same ids, same session, wLength 64. "Arm C misses, arm A hits" is a far
+  // stronger statement than "arm A hits" alone, and it costs 4 ticks not 12.
+  const uint16_t SWEEP_LAST = 0x18;
   const uint16_t PER_TICK   = 8;
   const uint32_t TMO_MS     = 150;
 
@@ -177,6 +184,91 @@ void UpsHidComponent::run_hid_diagnostics_() {
   } else {
     ESP_LOGI(TAG, "SWEEP progress: next 0x%02X (%u hit(s) so far)",
              (unsigned) diag_sweep_next_, diag_found_);
+  }
+}
+
+// ── cp825lcd-diagnostics phase 2: the wLength 2x2 ───────────────────────────
+// PRE-REGISTERED in docs/plans/ups-cp825lcd-no-hid-reports.md before it was run.
+//
+// The sweep asked all of 0x00-0x5F for BOTH report types and got a clean zero,
+// which killed the "different report map" theory. The descriptor then showed
+// this device declares 23 FEATURE reports at 0x01-0x18 with payloads of 1-6
+// bytes -- IDs that OVERLAP the ones the driver already asks for. So the IDs
+// were never the problem.
+//
+// The one field where we differ from NUT is wLength. NUT's libhid.c:131 sets
+// rbuf->len[id] = replen[id] + 1 (payload plus the leading report-ID byte) and
+// passes that; over-long asks are an opt-IN knob there (max_report_size). We
+// hardcode 64 -- ten times the largest report on this device.
+//
+// hid_get_report() already derives wLength from the caller's *data_len
+// (expected_len = min(*data_len, 64)), so this needs NO transport change: pass
+// a small length and the setup packet follows. That also keeps the real read
+// path untouched, which matters because A/B/C/E may work today precisely
+// BECAUSE their firmware tolerates 64 -- a change there is fleet-wide.
+//
+// Two arms, so the result discriminates rather than merely yes/no:
+//   A: declared payload + 1  -> a hit means exact-size requests are required
+//   B: 8 for every id        -> a hit means any SMALL ask works; 64 is just too long
+// Neither hits => hypothesis falsified, the setup packet is exonerated.
+//
+// GET only. Never SET: several CyberPower ids are commands when written (0x14
+// is the self-test). Reading 0x14 is what the driver already does every 10 s.
+void UpsHidComponent::run_wlength_probe_() {
+  if (diag_wlen_done_) return;
+
+  // Declared FEATURE payload per report id, parsed from this device's own
+  // 383-byte report descriptor. 0x11 is not declared, hence absent.
+  struct RepLen { uint8_t id; uint8_t payload; };
+  static const RepLen DECLARED[] = {
+    {0x01,1},{0x02,1},{0x03,1},{0x04,1},{0x05,1},{0x06,1},{0x07,6},{0x08,5},
+    {0x09,1},{0x0A,1},{0x0B,1},{0x0C,1},{0x0D,1},{0x0E,1},{0x0F,1},{0x10,2},
+    {0x12,1},{0x13,1},{0x14,1},{0x15,2},{0x16,2},{0x17,1},{0x18,2},
+  };
+  const uint16_t N = sizeof(DECLARED) / sizeof(DECLARED[0]);
+  const uint16_t PER_TICK = 6;
+  const uint32_t TMO_MS   = 150;
+
+  if (diag_wlen_next_ == 0) {
+    ESP_LOGI(TAG, "=== WLEN PROBE START: %u declared FEATURE ids, arm A=payload+1, arm B=8 ===", N);
+  }
+
+  uint8_t buf[64];
+  uint16_t done_this_tick = 0;
+  while (diag_wlen_next_ < N && done_this_tick < PER_TICK) {
+    const RepLen &r = DECLARED[diag_wlen_next_];
+    size_t l;
+
+    // arm A -- NUT's default: payload + 1 for the leading report-id byte
+    l = (size_t) r.payload + 1;
+    if (transport_->hid_get_report(HID_REPORT_TYPE_FEATURE, r.id, buf, &l, TMO_MS) == ESP_OK && l > 0) {
+      diag_wlen_hits_++;
+      ESP_LOGI(TAG, "WLEN HIT  A  id=0x%02X wLength=%u -> %u bytes  first=0x%02X",
+               r.id, (unsigned)(r.payload + 1), (unsigned) l, buf[0]);
+    }
+
+    // arm B -- a small constant, to separate "exact size" from "just not 64"
+    l = 8;
+    if (transport_->hid_get_report(HID_REPORT_TYPE_FEATURE, r.id, buf, &l, TMO_MS) == ESP_OK && l > 0) {
+      diag_wlen_hits_++;
+      ESP_LOGI(TAG, "WLEN HIT  B  id=0x%02X wLength=8 -> %u bytes  first=0x%02X",
+               r.id, (unsigned) l, buf[0]);
+    }
+
+    diag_wlen_next_++;
+    done_this_tick++;
+  }
+
+  if (diag_wlen_next_ >= N) {
+    diag_wlen_done_ = true;
+    ESP_LOGI(TAG, "=== WLEN PROBE COMPLETE: %u hit(s) across both arms ===", diag_wlen_hits_);
+    if (diag_wlen_hits_ == 0) {
+      ESP_LOGI(TAG, "WLEN: FALSIFIED -- exact-size and small-constant asks are refused too, "
+                    "so wLength is not the discriminator and the setup packet is exonerated.");
+    }
+  } else {
+    ESP_LOGI(TAG, "WLEN progress: %u/%u ids (%u hit(s) so far)",
+             (unsigned) diag_wlen_next_, (unsigned) N, diag_wlen_hits_);
   }
 }
 

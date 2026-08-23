@@ -407,35 +407,59 @@ void CyberPowerProtocol::parse_present_status_report(const HidReport &report, Up
 }
 
 void CyberPowerProtocol::parse_input_voltage_report(const HidReport &report, UpsData &data) {
-  if (report.data.size() < 3) {
+  if (report.data.size() < 2) {
     ESP_LOGW(CP_TAG, "Input voltage report too short: %zu bytes", report.data.size());
     return;
   }
+  // WIDTH-ADAPTIVE, matching parse_battery_voltage_report(). MEASURED
+  // 2026-08-22: the CP825LCD declares this report with a ONE-byte payload
+  // (2 bytes with the report id) and the byte holds the correct value --
+  // 0x0F returned `0F 7A` = 122 V on a 120 V circuit. The old fixed 16-bit
+  // read demanded 3 bytes and bailed, discarding a correct answer. The
+  // CP1500 generation returns 3+ bytes and is unaffected: it still takes
+  // the 16-bit path, byte for byte (verified on devices A and E).
+
 
   // NUT debug: Report 0x0f, Value: 231 (matches our 0x00E6 = 230)
   // Data format: [ID, volt_low, volt_high] - 16-bit little endian
-  uint16_t voltage_raw = report.data[1] | (report.data[2] << 8);
+  uint16_t voltage_raw = report.data[1];
+  if (report.data.size() >= 3) {
+    voltage_raw |= static_cast<uint16_t>(report.data[2]) << 8;
+  }
   // Input voltage is in volts directly, no scaling needed (unlike battery voltage)
   data.power.input_voltage = static_cast<float>(voltage_raw);
   
   ESP_LOGD(CP_TAG, "Input voltage: %.1fV (raw: 0x%02X%02X = %d)", 
-           data.power.input_voltage, report.data[2], report.data[1], voltage_raw);
+           data.power.input_voltage,
+           (report.data.size() >= 3) ? report.data[2] : 0, report.data[1], voltage_raw);
 }
 
 void CyberPowerProtocol::parse_output_voltage_report(const HidReport &report, UpsData &data) {
-  if (report.data.size() < 3) {
+  if (report.data.size() < 2) {
     ESP_LOGW(CP_TAG, "Output voltage report too short: %zu bytes", report.data.size());
     return;
   }
+  // WIDTH-ADAPTIVE, matching parse_battery_voltage_report(). MEASURED
+  // 2026-08-22: the CP825LCD declares this report with a ONE-byte payload
+  // (2 bytes with the report id) and the byte holds the correct value --
+  // 0x0F returned `0F 7A` = 122 V on a 120 V circuit. The old fixed 16-bit
+  // read demanded 3 bytes and bailed, discarding a correct answer. The
+  // CP1500 generation returns 3+ bytes and is unaffected: it still takes
+  // the 16-bit path, byte for byte (verified on devices A and E).
+
 
   // NUT debug: Report 0x12, Value: 231 (matches our 0x00E6 = 230)
   // Data format: [ID, volt_low, volt_high] - 16-bit little endian  
-  uint16_t voltage_raw = report.data[1] | (report.data[2] << 8);
+  uint16_t voltage_raw = report.data[1];
+  if (report.data.size() >= 3) {
+    voltage_raw |= static_cast<uint16_t>(report.data[2]) << 8;
+  }
   // Output voltage is in volts directly, no scaling needed (unlike battery voltage)
   data.power.output_voltage = static_cast<float>(voltage_raw);
   
   ESP_LOGD(CP_TAG, "Output voltage: %.1fV (raw: 0x%02X%02X = %d)", 
-           data.power.output_voltage, report.data[2], report.data[1], voltage_raw);
+           data.power.output_voltage,
+           (report.data.size() >= 3) ? report.data[2] : 0, report.data[1], voltage_raw);
 }
 
 void CyberPowerProtocol::parse_load_percent_report(const HidReport &report, UpsData &data) {
@@ -533,7 +557,7 @@ void CyberPowerProtocol::parse_input_voltage_nominal_report(const HidReport &rep
 }
 
 void CyberPowerProtocol::parse_input_transfer_report(const HidReport &report, UpsData &data) {
-  if (report.data.size() < 5) {
+  if (report.data.size() < 3) {
     ESP_LOGW(CP_TAG, "Input transfer report too short: %zu bytes", report.data.size());
     return;
   }
@@ -541,8 +565,19 @@ void CyberPowerProtocol::parse_input_transfer_report(const HidReport &report, Up
   // NUT debug shows: Report 0x10
   // Offset 0, Size 16: LowVoltageTransfer = 170
   // Offset 16, Size 16: HighVoltageTransfer = 260
-  uint16_t low_transfer = report.data[1] | (report.data[2] << 8);
-  uint16_t high_transfer = report.data[3] | (report.data[4] << 8);
+  // WIDTH-ADAPTIVE. Two fields, so the widths move together: 5 bytes means two
+  // 16-bit values, 3 bytes means two 8-bit ones. MEASURED 2026-08-22: the
+  // CP825LCD returned `10 64 8C` = 100 / 140 V, correct for a 120 V circuit,
+  // and the old >=5 guard discarded both. The CP1500 returns 5 and is
+  // unaffected (verified on devices A and E: 100 / 139 and 100 / 140).
+  uint16_t low_transfer, high_transfer;
+  if (report.data.size() >= 5) {
+    low_transfer  = report.data[1] | (report.data[2] << 8);
+    high_transfer = report.data[3] | (report.data[4] << 8);
+  } else {
+    low_transfer  = report.data[1];
+    high_transfer = report.data[2];
+  }
   
   data.power.input_transfer_low = static_cast<float>(low_transfer);
   data.power.input_transfer_high = static_cast<float>(high_transfer);

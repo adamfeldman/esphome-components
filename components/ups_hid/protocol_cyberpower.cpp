@@ -228,6 +228,7 @@ bool CyberPowerProtocol::read_data(UpsData &data) {
   // Set frequency to NaN - not available for CyberPower CP1500 model
   // Try to read frequency from HID reports
   read_frequency_data(data);
+  read_power_measurements(data);
   
   // TIMING FIX: Only read USB string descriptors after successful HID communication
   // This ensures the device is ready and responsive before attempting descriptor access
@@ -663,8 +664,63 @@ void CyberPowerProtocol::parse_realpower_nominal_report(const HidReport &report,
   // NUT debug shows: Report 0x18, Value: 900 (ConfigActivePower)
   uint16_t power_raw = report.data[1] | (report.data[2] << 8);
   data.power.realpower_nominal = static_cast<float>(power_raw);
-  
+
+  // ★ SECOND FIELD, present on A/B/C/E and absent on D. The descriptor declares
+  // report 0x18 as ConfigActivePower(0x44) THEN ConfigApparentPower(0x43), both
+  // 16-bit LE, at byte offsets 1 and 3. Upstream parsed only the first, and
+  // apparent_power_nominal was a field declared in data_power.h and referenced
+  // NOWHERE in the whole component -- computed-but-never-applied, the same class
+  // as check_battery_voltage_scaling.
+  //
+  // Gated on the actual report LENGTH rather than on a model or PID: D returns a
+  // 3-byte report here and simply has no second field, so this is the honest test
+  // and it needs no per-device knowledge.
+  if (report.data.size() >= 5) {
+    uint16_t va_raw = report.data[3] | (report.data[4] << 8);
+    data.power.apparent_power_nominal = static_cast<float>(va_raw);
+    ESP_LOGD(CP_TAG, "UPS nominal apparent power: %.0fVA", data.power.apparent_power_nominal);
+  }
+
   ESP_LOGD(CP_TAG, "UPS nominal real power: %.0fW", data.power.realpower_nominal);
+}
+
+// ★ MEASURED output power -- UPS.Output.ActivePower (W) and ApparentPower (VA).
+//
+// Located through the DESCRIPTOR, never a hardcoded report ID. On this fleet they
+// happen to be 0x19 and 0x1D, but D declares neither, and hardcoding would spend
+// four failed control transfers per poll on it forever -- the exact defect the
+// frequency guess-list was.
+//
+// SCALE: raw uint16 IS watts / VA; the descriptor's Unit Exponent +7 is ignored,
+// as NUT ignores it. Confirmed against a nameplate: E reads 450 for a 450 W unit.
+void CyberPowerProtocol::read_power_measurements(UpsData &data) {
+  struct { uint8_t usage; const char *what; float *dest; const char *unit; } fields[] = {
+    { hid_usage::POWER_ACTIVE,   "real power",     &data.power.realpower,      "W"  },
+    { hid_usage::POWER_APPARENT, "apparent power", &data.power.apparent_power, "VA" },
+  };
+
+  for (auto &f : fields) {
+    uint8_t report_id = 0;
+    if (!parent_->find_report_for_usage(hid_usage::PAGE_POWER_DEVICE, f.usage, &report_id)) {
+      // Not declared (or ambiguous, or no descriptor). Say nothing at INFO: on D
+      // this is the correct, permanent answer and would be noise every poll.
+      ESP_LOGV(CP_TAG, "No %s report declared (usage 0x84:0x%02X)", f.what, f.usage);
+      continue;
+    }
+    HidReport rpt;
+    if (!read_hid_report(report_id, rpt)) {
+      ESP_LOGW(CP_TAG, "Report 0x%02X declares %s but could not be read", report_id, f.what);
+      continue;
+    }
+    if (rpt.data.size() < 3) {
+      ESP_LOGW(CP_TAG, "%s report 0x%02X too short: %zu bytes", f.what, report_id, rpt.data.size());
+      continue;
+    }
+    uint16_t raw = rpt.data[1] | (rpt.data[2] << 8);
+    *f.dest = static_cast<float>(raw);
+    ESP_LOGD(CP_TAG, "UPS %s: %u %s (report 0x%02X, descriptor-declared)",
+             f.what, (unsigned) raw, f.unit, report_id);
+  }
 }
 
 void CyberPowerProtocol::parse_input_sensitivity_report(const HidReport &report, UpsData &data) {

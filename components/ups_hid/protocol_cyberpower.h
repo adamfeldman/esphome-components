@@ -120,6 +120,7 @@ class CyberPowerProtocol : public UpsProtocolBase {
   
   // Frequency reading methods
   void read_frequency_data(UpsData &data);
+  void read_power_measurements(UpsData &data);
   float parse_frequency_from_report(const HidReport &report);
 };
 

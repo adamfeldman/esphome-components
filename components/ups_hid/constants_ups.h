@@ -187,6 +187,13 @@ namespace sensor_type {
     static constexpr const char* INPUT_TRANSFER_HIGH = "input_transfer_high";
     static constexpr const char* BATTERY_RUNTIME_LOW = "battery_runtime_low";
     static constexpr const char* UPS_REALPOWER_NOMINAL = "ups_realpower_nominal";
+    // MEASURED output power, distinct from the *_NOMINAL ratings above and from
+    // the maintainer's "UPS Load Power" TEMPLATE sensor, which is an estimate
+    // (nominal x load%). Only devices whose descriptor declares the usage publish
+    // these; see PowerData in data_power.h.
+    static constexpr const char* UPS_REALPOWER = "ups_realpower";
+    static constexpr const char* UPS_APPARENT_POWER = "ups_apparent_power";
+    static constexpr const char* UPS_APPARENT_POWER_NOMINAL = "ups_apparent_power_nominal";
     static constexpr const char* UPS_DELAY_SHUTDOWN = "ups_delay_shutdown";
     static constexpr const char* UPS_DELAY_START = "ups_delay_start";
     static constexpr const char* UPS_DELAY_REBOOT = "ups_delay_reboot";

@@ -18,6 +18,8 @@ from esphome.const import (
     UNIT_HERTZ,
     UNIT_WATT,
     UNIT_SECOND,
+    UNIT_VOLT_AMPS,
+    DEVICE_CLASS_APPARENT_POWER,
 )
 
 
@@ -85,6 +87,29 @@ SENSOR_TYPES = {
     "ups_realpower_nominal": {
         "unit": UNIT_WATT,
         "device_class": DEVICE_CLASS_POWER,
+        "accuracy_decimals": 0,
+    },
+    # MEASURED output power, read from the device -- NOT the "UPS Load Power"
+    # template sensor in the maintainer's extended_sensors.yaml, which estimates
+    # realpower_nominal x load% (with a 700 W fallback). Both can coexist; the
+    # names are deliberately distinct so a dashboard cannot confuse them.
+    #
+    # ⚠ Only devices whose report descriptor declares the usage will ever publish
+    # these. On this fleet that is 4 of 5 -- the CP825LCD declares neither, and
+    # its sensors would sit at unknown forever, so do not declare them there.
+    "ups_realpower": {
+        "unit": UNIT_WATT,
+        "device_class": DEVICE_CLASS_POWER,
+        "accuracy_decimals": 0,
+    },
+    "ups_apparent_power": {
+        "unit": UNIT_VOLT_AMPS,
+        "device_class": DEVICE_CLASS_APPARENT_POWER,
+        "accuracy_decimals": 0,
+    },
+    "ups_apparent_power_nominal": {
+        "unit": UNIT_VOLT_AMPS,
+        "device_class": DEVICE_CLASS_APPARENT_POWER,
         "accuracy_decimals": 0,
     },
     "ups_delay_shutdown": {

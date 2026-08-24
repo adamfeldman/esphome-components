@@ -23,6 +23,22 @@ struct PowerData {
   // Power ratings and capabilities
   float realpower_nominal{NAN};        // Nominal real power rating (W)
   float apparent_power_nominal{NAN};   // Nominal apparent power rating (VA)
+
+  // MEASURED instantaneous output power. Distinct from the *_nominal ratings
+  // above, and distinct from the maintainer's "UPS Load Power" template sensor,
+  // which is an ESTIMATE: realpower_nominal x load_percent / 100, with a 700 W
+  // fallback when the nominal is unknown. These two are read from the device.
+  //
+  // ⚠ NOT declared by every unit -- D (CP825LCD, 383-byte descriptor) has neither
+  // report, while A/B/C/E do. They are read via the descriptor usage map, never a
+  // hardcoded report ID, so a device that lacks them spends no HID traffic.
+  //
+  // SCALE: the raw uint16 IS watts / VA. The descriptor advertises Unit Exponent
+  // +7 on both, and it is deliberately IGNORED -- NUT ignores it too, and the
+  // reading confirms it: E's ConfigActivePower reads 450 on a CP825AVRLCDa, whose
+  // nameplate is 825 VA / 450 W. Applying the exponent would give 4.5e9 W.
+  float realpower{NAN};                // Measured real power out (W)   -- UPS.Output.ActivePower
+  float apparent_power{NAN};           // Measured apparent power (VA)  -- UPS.Output.ApparentPower
   
   // Power status information
   std::string status{};                // Power status text (Online, On Battery, etc.)

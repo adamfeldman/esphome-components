@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>   // the hid_usage constants below are fixed-width
+
+
 /**
  * @file hid_constants.h  
  * @brief HID Constants for UPS Power Device Class
@@ -147,6 +150,19 @@
 #define FREQUENCY_NOMINAL_AU                    50.0f     // Australia
 
 // Frequency tolerance ranges (typical ±1% for power systems)
+// HID usage pages + the usages this driver looks up by name rather than by a
+// guessed report ID. Numbers are NUT's (drivers/libhid.c hid_usage_lkp), which is
+// the upstream that owns them -- a hand-typed copy of this table had 0x56/0x57
+// swapped and nearly filed a false bug against the shutdown-delay write path.
+namespace hid_usage {
+    static constexpr uint16_t PAGE_POWER_DEVICE   = 0x84;
+    static constexpr uint16_t PAGE_BATTERY_SYSTEM = 0x85;
+    static constexpr uint8_t  POWER_FREQUENCY     = 0x32;   // UPS.*.Frequency
+    static constexpr uint8_t  POWER_APPARENT      = 0x33;   // UPS.Output.ApparentPower
+    static constexpr uint8_t  POWER_ACTIVE        = 0x34;   // UPS.Output.ActivePower
+    static constexpr uint8_t  POWER_TEST          = 0x58;   // UPS.Output.Test
+}
+
 #define FREQUENCY_MIN_VALID                     47.0f     // Minimum valid frequency (50Hz -6%)
 #define FREQUENCY_MAX_VALID                     65.0f     // Maximum valid frequency (60Hz +8%)
 

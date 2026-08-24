@@ -47,6 +47,10 @@ public:
 
     esp_err_t get_report_descriptor(uint8_t* data, size_t* data_len,
                                     uint32_t timeout_ms = 1000) override;
+
+    bool find_report_for_usage(uint16_t usage_page, uint8_t usage,
+                               uint8_t* report_id) const override;
+    bool usage_map_known() const override { return usage_map_known_; }
     
     std::string get_last_error() const override;
 
@@ -77,6 +81,21 @@ private:
     // index 0 is unused and the array is deliberately [4].
     uint8_t  report_payload_len_[4][256]{};
     bool     report_lengths_known_{false};
+
+    // Reverse map built by the same descriptor walk: (page, usage) -> report id.
+    // Row 0 is Power Device (0x84), row 1 is Battery System (0x85); those are the
+    // only pages anything reads from, and the vendor page 0xFF01 is reached by a
+    // report ID we already know. 512 B of .bss, populated once per connect.
+    //
+    // usage_report_n_ is NOT redundant with a zero check: it counts how many
+    // DISTINCT report IDs declare the usage, so the lookup can refuse an
+    // ambiguous one. Report 0 is not a legal HID report id here, so 0 doubles as
+    // "absent" in usage_report_id_.
+    static constexpr uint8_t USAGE_PAGE_POWER_DEVICE   = 0x84;
+    static constexpr uint8_t USAGE_PAGE_BATTERY_SYSTEM = 0x85;
+    uint8_t  usage_report_id_[2][256]{};
+    uint8_t  usage_report_n_[2][256]{};
+    bool     usage_map_known_{false};
 
     // ── Parse scheduling. The parse used to be a single latched attempt, which
     // made ONE transient failure permanent for the whole boot -- and silent,

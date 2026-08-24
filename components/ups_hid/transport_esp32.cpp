@@ -1,6 +1,7 @@
 #include "transport_esp32.h"
 #include "constants_ups.h"
 #include "constants_hid.h"   // HID_REPORT_TYPE_* -- used by the descriptor-length parser
+#include <cstdio>            // snprintf -- the usage-map self-proving log line
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include "esphome/core/hal.h"    // millis() -- retry spacing for the descriptor parse
@@ -871,6 +872,9 @@ void Esp32UsbTransport::maybe_parse_report_descriptor_lengths_() {
 void Esp32UsbTransport::parse_report_descriptor_lengths_() {
     report_lengths_known_ = false;
     memset(report_payload_len_, 0, sizeof(report_payload_len_));
+    usage_map_known_ = false;
+    memset(usage_report_id_, 0, sizeof(usage_report_id_));
+    memset(usage_report_n_,  0, sizeof(usage_report_n_));
     // NB: attempt accounting and retry spacing belong to
     // maybe_parse_report_descriptor_lengths_(), which is the ONLY caller.
 
@@ -902,6 +906,14 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
     memset(bits, 0, sizeof(bits));
 
     uint16_t rid = 0, rsize = 0, rcount = 0;
+    // Usage Page is GLOBAL (persists until changed); Usage is LOCAL (consumed by
+    // the next Main item). Conflating the two scopes is the classic way to
+    // mis-walk a descriptor, so they are tracked separately and pending_usages
+    // is cleared at every Main item whether or not it was one we cared about.
+    uint16_t upage = 0;
+    uint8_t  pending_row[16];      // which page row (0 = 0x84, 1 = 0x85)
+    uint8_t  pending_usage[16];    // the usage id itself
+    uint8_t  n_pending = 0;
     size_t i = 0;
     while (i < len) {
         uint8_t b = desc[i++];
@@ -924,6 +936,26 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
             if      (tag == 0x84) rid    = (uint16_t) val;   // Report ID
             else if (tag == 0x74) rsize  = (uint16_t) val;   // Report Size (bits)
             else if (tag == 0x94) rcount = (uint16_t) val;   // Report Count
+            else if (tag == 0x04) upage  = (uint16_t) val;   // Usage Page
+        } else if (type == 2) {               // Local
+            // 0x08 Usage. A 4-byte Usage is an EXTENDED usage carrying its own
+            // page in the high 16 bits, which overrides the global page for that
+            // one item -- ignoring that would file it under the wrong page.
+            if (tag == 0x08 && n_pending < sizeof(pending_usage)) {
+                uint16_t item_page = (sz == 4) ? (uint16_t) (val >> 16) : upage;
+                uint8_t  item_usg  = (uint8_t) (val & 0xFF);
+                int8_t   row = -1;
+                if      (item_page == USAGE_PAGE_POWER_DEVICE)   row = 0;
+                else if (item_page == USAGE_PAGE_BATTERY_SYSTEM) row = 1;
+                if (row >= 0) {
+                    pending_row[n_pending]   = (uint8_t) row;
+                    pending_usage[n_pending] = item_usg;
+                    n_pending++;
+                }
+            }
+            // Usage Minimum/Maximum (0x18/0x28) describe RANGES -- deliberately
+            // not mapped. Nothing this driver reads is declared as a range, and
+            // expanding one would put dozens of synthetic entries in the map.
         } else if (type == 0) {               // Main
             uint8_t rt = 0;
             if      (tag == 0x80) rt = HID_REPORT_TYPE_INPUT;
@@ -931,7 +963,27 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
             else if (tag == 0xB0) rt = HID_REPORT_TYPE_FEATURE;
             if (rt != 0 && rid < 256) {
                 bits[rt][rid] += (uint32_t) rsize * (uint32_t) rcount;
+                for (uint8_t u = 0; u < n_pending; u++) {
+                    uint8_t row = pending_row[u], usg = pending_usage[u];
+                    if (usage_report_id_[row][usg] == 0) {
+                        usage_report_id_[row][usg] = (uint8_t) rid;
+                        usage_report_n_[row][usg]  = 1;
+                    } else if (usage_report_id_[row][usg] != (uint8_t) rid) {
+                        // A SECOND report declares it -> ambiguous from here on.
+                        // Saturate rather than wrap; the only thing callers ask is
+                        // "is this exactly one?".
+                        if (usage_report_n_[row][usg] < 255) usage_report_n_[row][usg]++;
+                    }
+                    // Same usage in the SAME report as both Feature and Input is
+                    // normal on this fleet (0x0B, 0x10, 0x14 all do it) and is NOT
+                    // ambiguity -- hence the != rid guard above.
+                }
             }
+            // Local items are consumed by EVERY Main item, including Collection
+            // and End Collection, whether or not we mapped anything from them.
+            // Leaving them pending would leak a Collection's usage onto the next
+            // Input/Feature and file a report under a usage it never declared.
+            n_pending = 0;
         }
     }
 
@@ -946,6 +998,16 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
         }
     }
 
+    uint16_t usages_mapped = 0, usages_ambiguous = 0;
+    for (uint8_t row = 0; row < 2; row++) {
+        for (uint16_t u = 0; u < 256; u++) {
+            if (usage_report_id_[row][u] == 0) continue;
+            usages_mapped++;
+            if (usage_report_n_[row][u] > 1) usages_ambiguous++;
+        }
+    }
+    usage_map_known_ = (usages_mapped > 0);
+
     report_lengths_known_ = (declared > 0);
     if (report_lengths_known_) report_lengths_known_at_ms_ = millis();
     ESP_LOGI(ESP32_USB_TAG,
@@ -956,6 +1018,45 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
         ESP_LOGW(ESP32_USB_TAG, "Descriptor parsed but declared NOTHING -- falling back to the "
                                 "legacy fixed length for every report.");
     }
+
+    // ★ SELF-PROVING LOG. The usage map's headline consumer (frequency) is
+    // expected to find NOTHING on this fleet, and "absent because the device does
+    // not declare it" reads identically to "absent because the map is empty or
+    // mis-walked". So the line carries a KNOWN POSITIVE next to the real query:
+    // Power Device usage 0x58 (Test) is declared by every CyberPower unit here,
+    // as report 0x14 -- the one the self-test button writes to. If Test resolves
+    // and Frequency does not, the map works and the device genuinely has no
+    // frequency. If Test does NOT resolve, distrust everything else on this line.
+    uint8_t probe_test = 0, probe_freq = 0;
+    bool have_test = find_report_for_usage(0x84, 0x58, &probe_test);
+    bool have_freq = find_report_for_usage(0x84, 0x32, &probe_freq);
+    char test_buf[24];
+    if (have_test) snprintf(test_buf, sizeof(test_buf), "report 0x%02X", probe_test);
+    else           snprintf(test_buf, sizeof(test_buf), "NOT FOUND -- map suspect");
+    char freq_buf[24];
+    if (have_freq) snprintf(freq_buf, sizeof(freq_buf), "report 0x%02X", probe_freq);
+    else           snprintf(freq_buf, sizeof(freq_buf), "not declared");
+    ESP_LOGI(ESP32_USB_TAG,
+             "Usage map: %u usage(s), %u ambiguous | control Test(84:58)=%s | Frequency(84:32)=%s",
+             (unsigned) usages_mapped, (unsigned) usages_ambiguous, test_buf, freq_buf);
+    if (have_test && probe_test != 0x14) {
+        ESP_LOGW(ESP32_USB_TAG, "Test usage maps to report 0x%02X, not the expected 0x14 -- "
+                                "this model differs from the fleet; verify before trusting writes.",
+                 probe_test);
+    }
+}
+
+bool Esp32UsbTransport::find_report_for_usage(uint16_t usage_page, uint8_t usage,
+                                              uint8_t* report_id) const {
+    if (!usage_map_known_) return false;
+    int8_t row = -1;
+    if      (usage_page == USAGE_PAGE_POWER_DEVICE)   row = 0;
+    else if (usage_page == USAGE_PAGE_BATTERY_SYSTEM) row = 1;
+    if (row < 0) return false;
+    if (usage_report_id_[row][usage] == 0) return false;
+    if (usage_report_n_[row][usage] != 1) return false;   // ambiguous -- see the header
+    if (report_id) *report_id = usage_report_id_[row][usage];
+    return true;
 }
 
 esp_err_t Esp32UsbTransport::claim_interface() {

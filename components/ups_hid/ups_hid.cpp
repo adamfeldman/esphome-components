@@ -122,6 +122,19 @@ esp_err_t UpsHidComponent::hid_get_report(uint8_t report_type, uint8_t report_id
   return transport_->hid_get_report(report_type, report_id, data, data_len, timeout_ms);
 }
 
+bool UpsHidComponent::find_report_for_usage(uint16_t usage_page, uint8_t usage,
+                                            uint8_t* report_id) {
+  // No transport ⇒ "I do not know", never "not declared". A caller that reads a
+  // false return as evidence ABOUT THE DEVICE would be wrong here.
+  if (!transport_) return false;
+  return transport_->find_report_for_usage(usage_page, usage, report_id);
+}
+
+bool UpsHidComponent::usage_map_known() {
+  if (!transport_) return false;
+  return transport_->usage_map_known();
+}
+
 esp_err_t UpsHidComponent::hid_set_report(uint8_t report_type, uint8_t report_id,
                                          const uint8_t* data, size_t data_len,
                                          uint32_t timeout_ms) {

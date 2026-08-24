@@ -1254,35 +1254,75 @@ void CyberPowerProtocol::parse_test_result_report(const HidReport &report, UpsDa
 }
 
 void CyberPowerProtocol::read_frequency_data(UpsData &data) {
-  // Initialize frequency to NaN
   data.power.frequency = NAN;
-  
-  // Try to read frequency from various HID report IDs
-  // CyberPower devices may have frequency in input/output measurement reports
-  
-  // Report IDs commonly used for frequency measurements:
-  const std::vector<uint8_t> frequency_report_ids = {
-    HID_USAGE_POW_FREQUENCY,     // 0x32 - Standard HID frequency usage
-    HID_USAGE_POW_VOLTAGE,       // 0x30 - Input measurements (may include frequency)  
-    HID_USAGE_POW_CURRENT,       // 0x31 - Output measurements (may include frequency)
-    0x11, // CyberPower-specific frequency report (based on NUT analysis)
-    INPUT_VOLTAGE_REPORT_ID,     // 0x0F - might contain frequency data
-    OUTPUT_VOLTAGE_REPORT_ID,    // 0x12 - might contain frequency data
-  };
-  
-  for (uint8_t report_id : frequency_report_ids) {
-    HidReport freq_report;
-    if (read_hid_report(report_id, freq_report)) {
-      float frequency_value = parse_frequency_from_report(freq_report);
-      if (!std::isnan(frequency_value)) {
-        data.power.frequency = frequency_value;
-        ESP_LOGD(CP_TAG, "Found frequency %.1f Hz in report 0x%02X", frequency_value, report_id);
-        return;
+
+  // ⛔ THIS USED TO BE A GUESS-LIST, AND IT WAS WORSE THAN GUESSING (upstream defect,
+  // fixed 2026-08-23). It tried report IDs { 0x32, 0x30, 0x31, 0x11, 0x0F, 0x12 } and
+  // took whatever parsed. Three problems, in increasing order of severity:
+  //
+  //  (a) TYPE CONFUSION. 0x32/0x30/0x31 are USAGE numbers (Frequency, Voltage,
+  //      Current) being passed where a REPORT ID is expected. They are not report
+  //      IDs on any device in this fleet; the comments calling them "Standard HID
+  //      frequency usage" say so out loud.
+  //
+  //  (b) IT COST TRAFFIC ON EVERY POLL, FOREVER. read_hid_report() has no
+  //      descriptor gate -- it issues a FEATURE transfer and, on failure, an INPUT
+  //      transfer. Four of the six IDs are declared by NO device here, so that is
+  //      8 control transfers that STALL, per device, per poll cycle, plus two
+  //      spurious voltage reads. For a sensor no config in this fleet declares.
+  //
+  //  (c) ⛔⛔ A "HIT" WOULD HAVE BEEN A FABRICATION. 0x0F is Input Voltage and 0x12
+  //      is Output Voltage -- descriptor-confirmed, both carrying mains volts. The
+  //      parser then tried FIVE reinterpretations of those bytes (raw, u16 LE, u16
+  //      BE, /10, /100) and accepted anything landing in 47.0-65.0 Hz. At 120 V
+  //      nominal nothing lands there, which is the only reason this was never seen
+  //      -- but a brownout or AVR transfer takes input voltage straight THROUGH
+  //      47-65 V, so it would fabricate a frequency precisely during the event you
+  //      most want the truth about.
+  //
+  // ⇒ Ask the DEVICE. find_report_for_usage() answers from the report descriptor
+  //   the device itself published, and returns false when the usage is declared by
+  //   more than one report rather than picking one (see transport_interface.h).
+  //
+  // ⚠ EXPECTED OUTCOME ON THIS FLEET IS "NOTHING", AND THAT IS THE CORRECT ANSWER,
+  //   not a regression: neither D (383-byte descriptor, complete) nor E (510-byte,
+  //   complete) declares Power Device usage 0x32 at all. C's capture is truncated
+  //   at 512 of 726 bytes so its tail is unexamined HERE -- but the runtime buffer
+  //   is 1024 B, so the map below sees C's whole descriptor. If C does declare a
+  //   frequency report, this will find it. That is a finding, not a bug.
+  uint8_t freq_report_id = 0;
+  if (!parent_->find_report_for_usage(hid_usage::PAGE_POWER_DEVICE,
+                                      hid_usage::POWER_FREQUENCY, &freq_report_id)) {
+    // Log ONCE, not every poll -- and say which of the two reasons it is, because
+    // "no frequency" and "no descriptor" want completely different follow-up.
+    if (!frequency_absence_logged_) {
+      frequency_absence_logged_ = true;
+      if (parent_->usage_map_known()) {
+        ESP_LOGI(CP_TAG, "No frequency: this device does not declare Power Device usage 0x32. "
+                         "Not an error -- the sensor will stay unavailable and no HID traffic "
+                         "is spent looking for it.");
+      } else {
+        ESP_LOGW(CP_TAG, "No frequency: the report descriptor was never parsed, so we cannot "
+                         "tell whether this device reports frequency. Check the descriptor log.");
       }
     }
+    return;   // ← the point of the change: ZERO USB transfers on the common path
   }
-  
-  ESP_LOGV(CP_TAG, "Frequency data not available from any HID report");
+
+  HidReport freq_report;
+  if (!read_hid_report(freq_report_id, freq_report)) {
+    ESP_LOGW(CP_TAG, "Report 0x%02X declares frequency but could not be read", freq_report_id);
+    return;
+  }
+  float frequency_value = parse_frequency_from_report(freq_report);
+  if (std::isnan(frequency_value)) {
+    ESP_LOGW(CP_TAG, "Report 0x%02X declares frequency but did not parse -- byte layout differs "
+                     "from every assumption in parse_frequency_from_report()", freq_report_id);
+    return;
+  }
+  data.power.frequency = frequency_value;
+  ESP_LOGD(CP_TAG, "Frequency %.1f Hz from report 0x%02X (descriptor-declared)",
+           frequency_value, freq_report_id);
 }
 
 float CyberPowerProtocol::parse_frequency_from_report(const HidReport &report) {

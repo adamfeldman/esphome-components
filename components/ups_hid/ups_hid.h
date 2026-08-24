@@ -214,6 +214,12 @@ namespace esphome
       esp_err_t hid_set_report(uint8_t report_type, uint8_t report_id,
                              const uint8_t* data, size_t data_len,
                              uint32_t timeout_ms = 1000);
+
+      // Descriptor-driven lookup: "which report declares this usage?" -- the
+      // replacement for guessing report IDs. False also means AMBIGUOUS (declared
+      // by more than one report), which is deliberate; see transport_interface.h.
+      bool find_report_for_usage(uint16_t usage_page, uint8_t usage, uint8_t* report_id);
+      bool usage_map_known();
       esp_err_t get_string_descriptor(uint8_t string_index, std::string& result);
       
       // Transport information

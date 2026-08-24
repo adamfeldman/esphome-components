@@ -4,6 +4,7 @@ from esphome.components import sensor
 from esphome.const import (
     CONF_ACCURACY_DECIMALS,
     CONF_DEVICE_CLASS,
+    CONF_STATE_CLASS,
     CONF_TYPE,
     CONF_UNIT_OF_MEASUREMENT,
     DEVICE_CLASS_BATTERY,
@@ -20,6 +21,7 @@ from esphome.const import (
     UNIT_SECOND,
     UNIT_VOLT_AMPS,
     DEVICE_CLASS_APPARENT_POWER,
+    STATE_CLASS_MEASUREMENT,
 )
 
 
@@ -34,60 +36,72 @@ SENSOR_TYPES = {
         "unit": UNIT_PERCENT,
         "device_class": DEVICE_CLASS_BATTERY,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "input_voltage": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 1,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "output_voltage": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 1,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "load_percent": {
         "unit": UNIT_PERCENT,
         "device_class": DEVICE_CLASS_POWER_FACTOR,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "runtime": {
         "unit": UNIT_MINUTE,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "frequency": {
         "unit": UNIT_HERTZ,
         "accuracy_decimals": 1,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "battery_voltage": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 1,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "battery_voltage_nominal": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "input_voltage_nominal": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "input_transfer_low": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "input_transfer_high": {
         "unit": UNIT_VOLT,
         "device_class": DEVICE_CLASS_VOLTAGE,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_realpower_nominal": {
         "unit": UNIT_WATT,
         "device_class": DEVICE_CLASS_POWER,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     # MEASURED output power, read from the device -- NOT the "UPS Load Power"
     # template sensor in the maintainer's extended_sensors.yaml, which estimates
@@ -101,48 +115,62 @@ SENSOR_TYPES = {
         "unit": UNIT_WATT,
         "device_class": DEVICE_CLASS_POWER,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_apparent_power": {
         "unit": UNIT_VOLT_AMPS,
         "device_class": DEVICE_CLASS_APPARENT_POWER,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_apparent_power_nominal": {
         "unit": UNIT_VOLT_AMPS,
         "device_class": DEVICE_CLASS_APPARENT_POWER,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_delay_shutdown": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_delay_start": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_delay_reboot": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     # Additional missing sensor types from NUT analysis
     "battery_charge_low": {
         "unit": UNIT_PERCENT,
         "device_class": DEVICE_CLASS_BATTERY,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "battery_charge_warning": {
         "unit": UNIT_PERCENT,
         "device_class": DEVICE_CLASS_BATTERY,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "battery_runtime_low": {
         "unit": UNIT_MINUTE,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
+        "state_class": STATE_CLASS_MEASUREMENT,
     },
+    # ⚠ NO state_class on the three ups_timer_* countdowns, deliberately.
+    # They carry a -1 SENTINEL when the timer is inactive (observed live on a
+    # CP1500: ups_delay_reboot = -1.0), so a long-term-statistics mean over them
+    # is not merely trivial, it is wrong -- it averages a sentinel with seconds.
+    # Every other type here is a real quantity, hence measurement.
     "ups_timer_reboot": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
@@ -190,6 +218,9 @@ async def to_code(config):
 
         if CONF_ACCURACY_DECIMALS not in config and "accuracy_decimals" in sensor_config:
             config[CONF_ACCURACY_DECIMALS] = sensor_config["accuracy_decimals"]
+
+        if CONF_STATE_CLASS not in config and "state_class" in sensor_config:
+            config[CONF_STATE_CLASS] = sensor_config["state_class"]
 
     parent = await cg.get_variable(config[CONF_UPS_HID_ID])
     var = await sensor.new_sensor(config)

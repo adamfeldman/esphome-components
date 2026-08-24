@@ -133,6 +133,34 @@ bool CyberPowerProtocol::read_data(UpsData &data) {
     parse_battery_voltage_nominal_report(battery_voltage_nominal_report, data);
   }
 
+  // NUT quirk port -- cps-hid.c cps_adjust_battery_scale(): some CyberPower
+  // firmware over-reports battery voltage by a factor of 1.5, so NUT scales by
+  // 2/3 when actual/nominal exceeds 1.4. check_battery_voltage_scaling() already
+  // implemented that heuristic but was never called and its result was never
+  // applied -- this wires it up. Must run after BOTH 0x0A and 0x09 are parsed.
+  //
+  // Measured on device D (CP825LCD, 0x0764:0x0501): declares 12.0 V nominal and
+  // reports 20.2 V float / 17.4 V under 54 W. Corrected: 13.47 V / 11.6 V, both
+  // ordinary for a 12 V SLA pack, and 13.47 lands on sibling E's 13.6 V.
+  //
+  // Deliberately NOT PID-gated the way NUT gates it. The ratio is the real
+  // discriminator and separates this fleet cleanly -- 1.071 / 1.129 / 1.133 /
+  // 1.133 against D's 1.683 -- while the PID is still unknown for three of the
+  // five units. No lead-acid chemistry floats above 1.4x nominal, so a false
+  // positive would need a genuinely exotic pack.
+  //
+  // WARNING: the decision LATCHES on the first cycle where both values are
+  // present, exactly as NUT's does. A first reading taken during a deep
+  // discharge could fall below 1.4 and latch "no scaling" wrongly. D measures
+  // 1.45 even under load, so there is margin -- but it is not unlimited, and a
+  // device powered up on a flat battery is the case to watch.
+  if (data.battery.voltage_nominal > 0.0f && !std::isnan(data.battery.voltage)) {
+    check_battery_voltage_scaling(data.battery.voltage, data.battery.voltage_nominal);
+    if (battery_voltage_scale_ != 1.0f) {
+      data.battery.voltage *= battery_voltage_scale_;
+    }
+  }
+
   // Read input voltage nominal (Report 0x0e)
   HidReport input_voltage_nominal_report;
   if (read_hid_report(INPUT_VOLTAGE_NOMINAL_REPORT_ID, input_voltage_nominal_report)) {
@@ -891,8 +919,16 @@ void CyberPowerProtocol::read_missing_dynamic_values(UpsData &data) {
     }
   }
   
-  // 5. Set static/derived values based on NUT behavior  
-  data.test.ups_test_result = test::RESULT_NO_TEST;  // Default test result
+  // 5. Set static/derived values based on NUT behavior
+  // DEFAULT it only -- do not clobber what the 0x14 parse already produced.
+  // read_data() parses the test result at ~line 123 and calls this function at
+  // ~line 236, so an unconditional assignment here overwrote the real value on
+  // every cycle. Measured on device D 2026-08-23: the driver logged
+  // "Test result: Done and passed (raw: 1)" and the sensor published
+  // "No test initiated" 169 ms later, every cycle, on every device in the fleet.
+  if (data.test.ups_test_result.empty()) {
+    data.test.ups_test_result = test::RESULT_NO_TEST;  // Default test result
+  }
   
   // NOTE: battery_status is now properly set based on charging state in parse_present_status_report
   

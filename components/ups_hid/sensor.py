@@ -219,8 +219,17 @@ async def to_code(config):
         if CONF_ACCURACY_DECIMALS not in config and "accuracy_decimals" in sensor_config:
             config[CONF_ACCURACY_DECIMALS] = sensor_config["accuracy_decimals"]
 
+        # ⚠ state_class is NOT like its three siblings above. device_class and
+        # unit_of_measurement are plain strings in C++, so injecting the raw
+        # string works. Sensor::set_state_class() takes an ENUM -- the YAML path
+        # gets there via the schema's cv.enum(STATE_CLASSES), which we bypass by
+        # writing into config after validation. Injecting the bare string emits
+        # `set_state_class("measurement")` and FAILS TO COMPILE. Run it through
+        # the same validator the schema uses, so the value is identical to YAML's.
         if CONF_STATE_CLASS not in config and "state_class" in sensor_config:
-            config[CONF_STATE_CLASS] = sensor_config["state_class"]
+            config[CONF_STATE_CLASS] = sensor.validate_state_class(
+                sensor_config["state_class"]
+            )
 
     parent = await cg.get_variable(config[CONF_UPS_HID_ID])
     var = await sensor.new_sensor(config)

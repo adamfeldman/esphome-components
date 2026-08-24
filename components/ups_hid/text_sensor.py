@@ -29,6 +29,12 @@ TEXT_SENSOR_TYPES = [
     "ups_mfr_date",
     "ups_firmware_aux",
     "ups_test_result",
+    # USB VendorID:ProductID of the attached UPS, e.g. "0764:0501".
+    # Exposed as an entity because it is otherwise emitted ONCE, at USB init,
+    # before the network exists -- unreachable by esphome logs or /events, and
+    # dump_config() is not replayed to new subscribers. It gates vendor quirks
+    # (NUT keys its CyberPower fixups on PID), so it needs to be readable.
+    "usb_id",
 ]
 
 

@@ -389,6 +389,14 @@ void UpsHidComponent::update_sensors() {
       value = ups_data_.battery.type;
     } else if (type == text_sensor_type::UPS_FIRMWARE_AUX && !ups_data_.device.firmware_aux.empty()) {
       value = ups_data_.device.firmware_aux;
+    } else if (type == text_sensor_type::USB_ID && transport_ && transport_->is_connected()) {
+      // Static for the life of the connection, but published like any other
+      // value: the IDs are logged only at USB init, which happens before the
+      // network is up, so a log line can never carry them off the device.
+      char usb_id_buf[16];
+      snprintf(usb_id_buf, sizeof(usb_id_buf), "%04X:%04X",
+               transport_->get_vendor_id(), transport_->get_product_id());
+      value = usb_id_buf;
     }
     
     if (!value.empty()) {

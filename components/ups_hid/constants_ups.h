@@ -224,6 +224,7 @@ namespace text_sensor_type {
     static constexpr const char* UPS_MFR_DATE = "ups_mfr_date";
     static constexpr const char* BATTERY_TYPE = "battery_type";
     static constexpr const char* UPS_FIRMWARE_AUX = "ups_firmware_aux";
+    static constexpr const char* USB_ID = "usb_id";
 }
 
 // ==================== Input Sensitivity Values ====================

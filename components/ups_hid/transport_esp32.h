@@ -96,6 +96,18 @@ private:
     uint8_t  usage_report_id_[2][256]{};
     uint8_t  usage_report_n_[2][256]{};
     bool     usage_map_known_{false};
+    // ⚠ The usage-map summary CANNOT be logged where it is computed. The
+    // descriptor parse runs inside the first poll, before the API/log connection
+    // exists, so anything it prints is unreachable over the network -- measured
+    // 2026-08-23 on device D: 248 log lines captured, ZERO containing it. That is
+    // the same trap report_lengths_confirmed_logged_ already exists to dodge, and
+    // it was walked into anyway by the person who read that comment. These carry
+    // the result forward to the DELAYED one-shot in hid_get_report().
+    uint16_t usages_mapped_{0};
+    uint16_t usages_ambiguous_{0};
+    uint8_t  probe_test_report_{0};      // 0x84:0x58 Test -- the known positive
+    uint8_t  probe_freq_report_{0};      // 0x84:0x32 Frequency -- the real query
+    bool     usage_map_logged_{false};
 
     // ── Parse scheduling. The parse used to be a single latched attempt, which
     // made ONE transient failure permanent for the whole boot -- and silent,

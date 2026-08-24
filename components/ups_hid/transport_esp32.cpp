@@ -149,6 +149,29 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
             }
         }
     }
+
+    // Second delayed one-shot, same reason and same delay as above: the usage map
+    // is built during the first poll, so this is the only place its summary can
+    // actually be READ. Deliberately NOT nested inside the `declared > 0` branch
+    // above -- an empty map is exactly the case worth hearing about.
+    if (report_lengths_known_ && !usage_map_logged_ &&
+        (uint32_t)(millis() - report_lengths_known_at_ms_) >= REPORT_LENGTH_CONFIRM_DELAY_MS) {
+        usage_map_logged_ = true;
+        char test_buf[28], freq_buf[28];
+        if (probe_test_report_) snprintf(test_buf, sizeof(test_buf), "report 0x%02X", probe_test_report_);
+        else                    snprintf(test_buf, sizeof(test_buf), "NOT FOUND -- map suspect");
+        if (probe_freq_report_) snprintf(freq_buf, sizeof(freq_buf), "report 0x%02X", probe_freq_report_);
+        else                    snprintf(freq_buf, sizeof(freq_buf), "not declared");
+        ESP_LOGI(ESP32_USB_TAG,
+                 "Usage map: %u usage(s), %u ambiguous | control Test(84:58)=%s | Frequency(84:32)=%s",
+                 (unsigned) usages_mapped_, (unsigned) usages_ambiguous_, test_buf, freq_buf);
+        if (probe_test_report_ && probe_test_report_ != 0x14) {
+            ESP_LOGW(ESP32_USB_TAG, "Test usage maps to report 0x%02X, not the expected 0x14 -- this "
+                                    "model differs from the fleet; verify before trusting writes.",
+                     probe_test_report_);
+        }
+    }
+
     size_t expected_len = std::min(std::min(want, *data_len), sizeof(buffer));
     
     // Create USB control transfer for HID GET_REPORT
@@ -1019,31 +1042,20 @@ void Esp32UsbTransport::parse_report_descriptor_lengths_() {
                                 "legacy fixed length for every report.");
     }
 
-    // ★ SELF-PROVING LOG. The usage map's headline consumer (frequency) is
-    // expected to find NOTHING on this fleet, and "absent because the device does
-    // not declare it" reads identically to "absent because the map is empty or
-    // mis-walked". So the line carries a KNOWN POSITIVE next to the real query:
-    // Power Device usage 0x58 (Test) is declared by every CyberPower unit here,
-    // as report 0x14 -- the one the self-test button writes to. If Test resolves
-    // and Frequency does not, the map works and the device genuinely has no
-    // frequency. If Test does NOT resolve, distrust everything else on this line.
-    uint8_t probe_test = 0, probe_freq = 0;
-    bool have_test = find_report_for_usage(0x84, 0x58, &probe_test);
-    bool have_freq = find_report_for_usage(0x84, 0x32, &probe_freq);
-    char test_buf[24];
-    if (have_test) snprintf(test_buf, sizeof(test_buf), "report 0x%02X", probe_test);
-    else           snprintf(test_buf, sizeof(test_buf), "NOT FOUND -- map suspect");
-    char freq_buf[24];
-    if (have_freq) snprintf(freq_buf, sizeof(freq_buf), "report 0x%02X", probe_freq);
-    else           snprintf(freq_buf, sizeof(freq_buf), "not declared");
-    ESP_LOGI(ESP32_USB_TAG,
-             "Usage map: %u usage(s), %u ambiguous | control Test(84:58)=%s | Frequency(84:32)=%s",
-             (unsigned) usages_mapped, (unsigned) usages_ambiguous, test_buf, freq_buf);
-    if (have_test && probe_test != 0x14) {
-        ESP_LOGW(ESP32_USB_TAG, "Test usage maps to report 0x%02X, not the expected 0x14 -- "
-                                "this model differs from the fleet; verify before trusting writes.",
-                 probe_test);
-    }
+    // ★ SELF-PROVING SUMMARY -- STASHED, NOT LOGGED HERE. See the header: this
+    // function runs inside the first poll and nothing it prints can be captured.
+    // The reading it supports is an ABSENCE ("this device declares no frequency"),
+    // which is indistinguishable from a broken map -- so it carries a KNOWN
+    // POSITIVE alongside: Power Device 0x58 (Test) is declared by every CyberPower
+    // unit here as report 0x14, the one the self-test button writes to. If Test
+    // resolves and Frequency does not, the map works. If Test does not resolve,
+    // distrust the whole line.
+    usages_mapped_    = usages_mapped;
+    usages_ambiguous_ = usages_ambiguous;
+    probe_test_report_ = 0;
+    probe_freq_report_ = 0;
+    find_report_for_usage(0x84, 0x58, &probe_test_report_);
+    find_report_for_usage(0x84, 0x32, &probe_freq_report_);
 }
 
 bool Esp32UsbTransport::find_report_for_usage(uint16_t usage_page, uint8_t usage,

@@ -120,9 +120,6 @@ class CyberPowerProtocol : public UpsProtocolBase {
   
   // Frequency reading methods
   void read_frequency_data(UpsData &data);
-  // One-shot: the "this device has no frequency" line is a per-DEVICE fact, so it
-  // is logged once per boot rather than on every poll.
-  bool frequency_absence_logged_{false};
   float parse_frequency_from_report(const HidReport &report);
 };
 

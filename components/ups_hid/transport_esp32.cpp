@@ -154,9 +154,22 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     // is built during the first poll, so this is the only place its summary can
     // actually be READ. Deliberately NOT nested inside the `declared > 0` branch
     // above -- an empty map is exactly the case worth hearing about.
-    if (report_lengths_known_ && !usage_map_logged_ &&
+    // ⛔ NOT gated on report_lengths_known_. A descriptor that never parsed is the
+    // single case most worth hearing about, and gating on success would silence
+    // exactly it -- the parser's own "descriptor unavailable" WARN is emitted at
+    // parse time and is therefore unreachable over the network, like everything
+    // else in that function. This line is the only readable report of that state.
+    // When the parse failed, report_lengths_known_at_ms_ is still 0, so the delay
+    // degrades to "5 s of uptime", which is the behaviour we want.
+    if (!usage_map_logged_ &&
         (uint32_t)(millis() - report_lengths_known_at_ms_) >= REPORT_LENGTH_CONFIRM_DELAY_MS) {
         usage_map_logged_ = true;
+        if (!usage_map_known_) {
+            ESP_LOGW(ESP32_USB_TAG,
+                     "Usage map is EMPTY -- the report descriptor was not parsed, so this device's "
+                     "capabilities are UNKNOWN rather than absent. Any 'not declared' elsewhere is "
+                     "meaningless until this is fixed.");
+        } else {
         char test_buf[28], freq_buf[28];
         if (probe_test_report_) snprintf(test_buf, sizeof(test_buf), "report 0x%02X", probe_test_report_);
         else                    snprintf(test_buf, sizeof(test_buf), "NOT FOUND -- map suspect");
@@ -169,6 +182,7 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
             ESP_LOGW(ESP32_USB_TAG, "Test usage maps to report 0x%02X, not the expected 0x14 -- this "
                                     "model differs from the fleet; verify before trusting writes.",
                      probe_test_report_);
+        }
         }
     }
 

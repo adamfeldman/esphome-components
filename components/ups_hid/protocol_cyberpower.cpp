@@ -1293,19 +1293,19 @@ void CyberPowerProtocol::read_frequency_data(UpsData &data) {
   uint8_t freq_report_id = 0;
   if (!parent_->find_report_for_usage(hid_usage::PAGE_POWER_DEVICE,
                                       hid_usage::POWER_FREQUENCY, &freq_report_id)) {
-    // Log ONCE, not every poll -- and say which of the two reasons it is, because
-    // "no frequency" and "no descriptor" want completely different follow-up.
-    if (!frequency_absence_logged_) {
-      frequency_absence_logged_ = true;
-      if (parent_->usage_map_known()) {
-        ESP_LOGI(CP_TAG, "No frequency: this device does not declare Power Device usage 0x32. "
-                         "Not an error -- the sensor will stay unavailable and no HID traffic "
-                         "is spent looking for it.");
-      } else {
-        ESP_LOGW(CP_TAG, "No frequency: the report descriptor was never parsed, so we cannot "
-                         "tell whether this device reports frequency. Check the descriptor log.");
-      }
-    }
+    // ⛔ DELIBERATELY ONLY DEBUG, AND DELIBERATELY NOT A ONE-SHOT. The obvious
+    // design -- an INFO logged once -- is UNREADABLE: read_data() first runs
+    // inside the first poll, before the API/log connection exists, so a one-shot
+    // here can never be captured on any device, ever. That is the same trap the
+    // transport's two delayed one-shots exist to dodge.
+    //
+    // The authoritative, READABLE report of both states is the transport's
+    // "Usage map:" line, which names Frequency explicitly and, when the
+    // descriptor never parsed, warns that capabilities are UNKNOWN rather than
+    // absent -- the distinction this log used to carry. So this is a convenience
+    // for someone already running at DEBUG, not the evidence.
+    ESP_LOGD(CP_TAG, "No frequency report declared by this device (usage 0x84:0x32); "
+                     "skipping -- no HID traffic is spent looking for it.");
     return;   // ← the point of the change: ZERO USB transfers on the common path
   }
 

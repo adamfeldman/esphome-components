@@ -333,11 +333,20 @@ void UpsHidComponent::update_sensors() {
       value = ups_data_.battery.runtime_low;
     } else if (type == sensor_type::UPS_REALPOWER_NOMINAL && !std::isnan(ups_data_.power.realpower_nominal)) {
       value = ups_data_.power.realpower_nominal;
-    } else if (type == sensor_type::UPS_DELAY_SHUTDOWN && !std::isnan(ups_data_.config.delay_shutdown)) {
+    // The three delay_* fields are int16_t with a documented -1 "not set" default
+    // (data_config.h), so the sentinel test is `!= -1` -- exactly as the ups_timer_*
+    // arms below already do it.
+    // ⛔ These read `!std::isnan(...)` until 2026-08-25, which is VACUOUS on an integer:
+    // std::isnan() has an integral overload that always returns false, so `!isnan(x)`
+    // was always true and the "do not publish when unset" intent never held. It compiled
+    // clean, and the two idioms sat three lines apart in this same chain -- the timers
+    // correct, the delays inert. Consequence: delay_reboot is never assigned at all by
+    // the CyberPower protocol, so all five devices published a permanent -1.
+    } else if (type == sensor_type::UPS_DELAY_SHUTDOWN && ups_data_.config.delay_shutdown != -1) {
       value = ups_data_.config.delay_shutdown;
-    } else if (type == sensor_type::UPS_DELAY_START && !std::isnan(ups_data_.config.delay_start)) {
+    } else if (type == sensor_type::UPS_DELAY_START && ups_data_.config.delay_start != -1) {
       value = ups_data_.config.delay_start;
-    } else if (type == sensor_type::UPS_DELAY_REBOOT && !std::isnan(ups_data_.config.delay_reboot)) {
+    } else if (type == sensor_type::UPS_DELAY_REBOOT && ups_data_.config.delay_reboot != -1) {
       value = ups_data_.config.delay_reboot;
     } else if (type == sensor_type::UPS_TIMER_REBOOT && ups_data_.test.timer_reboot != -1) {
       value = ups_data_.test.timer_reboot;

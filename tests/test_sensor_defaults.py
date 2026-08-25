@@ -20,9 +20,21 @@ from pathlib import Path
 
 SENSOR_PY = Path(__file__).parent.parent / "components" / "ups_hid" / "sensor.py"
 
-# The three ups_timer_* countdowns carry a -1 sentinel when inactive, so a
-# long-term-statistics mean over them is wrong rather than merely trivial.
-TIMERS_WITHOUT_STATE_CLASS = {
+# Six types carry a -1 sentinel meaning "not set"/"inactive", so a long-term-
+# statistics mean over them is wrong rather than merely trivial: it averages a
+# sentinel with seconds.
+#
+# The three ups_delay_* were added on 2026-08-25, after shipping WITH state_class.
+# Keeping the story here because the fixture is what would have caught it: the
+# sensor.py comment cited `ups_delay_reboot = -1.0` as the evidence for excluding
+# the timers, then left state_class on ups_delay_reboot itself. Measured live at
+# the time: delay_reboot reads -1.0 on both device A and device D, and is never
+# assigned at all by the CyberPower protocol; device D reads delay_shutdown =
+# -16246 from firmware that does not implement the report.
+TYPES_WITHOUT_STATE_CLASS = {
+    "ups_delay_shutdown",
+    "ups_delay_start",
+    "ups_delay_reboot",
     "ups_timer_reboot",
     "ups_timer_shutdown",
     "ups_timer_start",
@@ -65,11 +77,11 @@ def _state_class_guard():
     return found[0]
 
 
-def test_every_non_timer_type_has_a_state_class_default():
+def test_only_the_sentinel_types_lack_a_state_class_default():
     """Without state_class, Home Assistant records no long-term statistics."""
     types = _sensor_types()
     missing = {k for k, v in types.items() if "state_class" not in v}
-    assert missing == TIMERS_WITHOUT_STATE_CLASS, f"unexpected exclusions: {sorted(missing)}"
+    assert missing == TYPES_WITHOUT_STATE_CLASS, f"unexpected exclusions: {sorted(missing)}"
 
 
 def test_state_class_defaults_are_measurement():

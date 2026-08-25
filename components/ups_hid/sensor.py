@@ -133,19 +133,16 @@ SENSOR_TYPES = {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
-        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_delay_start": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
-        "state_class": STATE_CLASS_MEASUREMENT,
     },
     "ups_delay_reboot": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,
         "accuracy_decimals": 0,
-        "state_class": STATE_CLASS_MEASUREMENT,
     },
     # Additional missing sensor types from NUT analysis
     "battery_charge_low": {
@@ -166,11 +163,27 @@ SENSOR_TYPES = {
         "accuracy_decimals": 0,
         "state_class": STATE_CLASS_MEASUREMENT,
     },
-    # ⚠ NO state_class on the three ups_timer_* countdowns, deliberately.
-    # They carry a -1 SENTINEL when the timer is inactive (observed live on a
-    # CP1500: ups_delay_reboot = -1.0), so a long-term-statistics mean over them
-    # is not merely trivial, it is wrong -- it averages a sentinel with seconds.
-    # Every other type here is a real quantity, hence measurement.
+    # ⚠ NO state_class on the three ups_timer_* countdowns OR the three ups_delay_*
+    # settings, deliberately. All six carry a -1 SENTINEL meaning "not set"/"inactive"
+    # -- it is the documented default of the fields themselves (data_config.h:
+    # `int16_t delay_shutdown{-1}  // -1 = not set`) -- so a long-term-statistics mean
+    # over them is not merely trivial, it is wrong: it averages a sentinel with seconds.
+    #
+    # ⛔ The ups_delay_* trio was EXCLUDED ON 2026-08-25 AFTER SHIPPING WITH state_class,
+    # and the mistake is worth keeping visible: the original comment here cited
+    # `ups_delay_reboot = -1.0` as the EVIDENCE for excluding the ups_timer_* trio, and
+    # then left state_class on ups_delay_reboot itself. The evidence and the exclusion
+    # disagreed two lines apart. Confirmed live before fixing: ups_delay_reboot reads
+    # -1.0 on BOTH device A and device D.
+    #
+    # Measured on the CyberPower fleet, and each fact independently justifies exclusion:
+    #   * delay_reboot is NEVER assigned by the CyberPower protocol at all (only APC and
+    #     generic populate it), so on these five devices it is permanently the -1 default;
+    #   * device D reports delay_shutdown = -16246 (0xC08A) -- its 2007-era firmware does
+    #     not implement DelayBeforeShutdown. See the plausibility guard in
+    #     protocol_cyberpower.cpp, which now rejects it.
+    # These are CONFIGURATION values, not measurements. Every other type here is a real
+    # quantity, hence measurement.
     "ups_timer_reboot": {
         "unit": UNIT_SECOND,
         "device_class": DEVICE_CLASS_DURATION,

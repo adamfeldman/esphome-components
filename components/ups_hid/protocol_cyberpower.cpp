@@ -630,6 +630,31 @@ void CyberPowerProtocol::parse_delay_shutdown_report(const HidReport &report, Up
     ESP_LOGD(CP_TAG, "UPS delay shutdown: %d seconds (default, raw: 0xFFFF)", defaults::CYBERPOWER_SHUTDOWN_DELAY_SEC);
   } else {
     int16_t delay_raw = static_cast<int16_t>(delay_raw_unsigned);
+    // PLAUSIBILITY GUARD (2026-08-25). The USB HID Power Device Class usage tables
+    // (usage 0x57, section 4.1.4) define this value as "the number of seconds
+    // remaining until shutdown, or -1 if no shutdown countdown is in effect". -1 is
+    // 0xFFFF and is handled above, so ANY OTHER NEGATIVE VALUE IS NOT A DELAY -- the
+    // spec admits no encoding that produces one.
+    //
+    // Measured on device D (CP825LCD, 2007-era firmware): this reads -16246 (0xC08A),
+    // stable for days, while A/B/C/E all read 0xFFFF here. The report is 3 bytes on D
+    // so the length guard above never fires -- the firmware simply does not implement
+    // the usage and returns a constant. Publishing that as a duration put a meaningless
+    // number in front of the user and, once state_class was added, would have recorded
+    // it into long-term statistics permanently.
+    //
+    // Leaving the field at its -1 "not set" default (data_config.h) is the honest
+    // outcome and needs no new sentinel.
+    // NB DEBUG, not WARN, on purpose: this fires every poll forever on a device whose
+    // firmware will never change, and this component already logs ~15 lines per failed
+    // poll with the rate limiter that was never wired (see ups_hid.h, ErrorRateLimit).
+    // The visible signal is the entity going unavailable, which is stronger than a log line.
+    if (delay_raw < 0) {
+      ESP_LOGD(CP_TAG, "UPS delay shutdown: implausible raw value %d (0x%04X) -- not a delay; "
+               "leaving unset. Firmware likely does not implement this usage.",
+               delay_raw, delay_raw_unsigned);
+      return;
+    }
     data.config.delay_shutdown = delay_raw;
     ESP_LOGD(CP_TAG, "UPS delay shutdown: %d seconds", data.config.delay_shutdown);
   }
@@ -650,6 +675,31 @@ void CyberPowerProtocol::parse_delay_start_report(const HidReport &report, UpsDa
     ESP_LOGD(CP_TAG, "UPS delay start: %d seconds (default, raw: 0xFFFF)", defaults::CYBERPOWER_STARTUP_DELAY_SEC);
   } else {
     int16_t delay_raw = static_cast<int16_t>(delay_raw_unsigned);
+    // PLAUSIBILITY GUARD (2026-08-25). The USB HID Power Device Class usage tables
+    // (usage 0x56, section 4.1.4) define this value as "the number of seconds
+    // remaining until startup, or -1 if no startup countdown is in effect". -1 is
+    // 0xFFFF and is handled above, so ANY OTHER NEGATIVE VALUE IS NOT A DELAY -- the
+    // spec admits no encoding that produces one.
+    //
+    // Measured on device D (CP825LCD, 2007-era firmware): this reads -16246 (0xC08A),
+    // stable for days, while A/B/C/E all read 0xFFFF here. The report is 3 bytes on D
+    // so the length guard above never fires -- the firmware simply does not implement
+    // the usage and returns a constant. Publishing that as a duration put a meaningless
+    // number in front of the user and, once state_class was added, would have recorded
+    // it into long-term statistics permanently.
+    //
+    // Leaving the field at its -1 "not set" default (data_config.h) is the honest
+    // outcome and needs no new sentinel.
+    // NB DEBUG, not WARN, on purpose: this fires every poll forever on a device whose
+    // firmware will never change, and this component already logs ~15 lines per failed
+    // poll with the rate limiter that was never wired (see ups_hid.h, ErrorRateLimit).
+    // The visible signal is the entity going unavailable, which is stronger than a log line.
+    if (delay_raw < 0) {
+      ESP_LOGD(CP_TAG, "UPS delay start: implausible raw value %d (0x%04X) -- not a delay; "
+               "leaving unset. Firmware likely does not implement this usage.",
+               delay_raw, delay_raw_unsigned);
+      return;
+    }
     data.config.delay_start = delay_raw;
     ESP_LOGD(CP_TAG, "UPS delay start: %d seconds", data.config.delay_start);
   }

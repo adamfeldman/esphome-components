@@ -16,7 +16,9 @@ sensor:
     type: ups_timer_shutdown
     unit_of_measurement: "s"
     device_class: duration
-    state_class: measurement
+    # ⛔ NO state_class, deliberately: this carries a -1 "not set"/"inactive"
+    # sentinel, so a long-term-statistics mean would average a sentinel with
+    # seconds. Reasoning + the measured evidence: SENSOR_TYPES in sensor.py.
     accuracy_decimals: 0
     icon: "mdi:timer-outline"
     web_server:
@@ -32,7 +34,9 @@ sensor:
     type: ups_timer_start
     unit_of_measurement: "s"
     device_class: duration
-    state_class: measurement
+    # ⛔ NO state_class, deliberately: this carries a -1 "not set"/"inactive"
+    # sentinel, so a long-term-statistics mean would average a sentinel with
+    # seconds. Reasoning + the measured evidence: SENSOR_TYPES in sensor.py.
     accuracy_decimals: 0
     icon: "mdi:timer-outline"
     web_server:
@@ -48,7 +52,9 @@ sensor:
     type: ups_timer_reboot
     unit_of_measurement: "s"
     device_class: duration
-    state_class: measurement
+    # ⛔ NO state_class, deliberately: this carries a -1 "not set"/"inactive"
+    # sentinel, so a long-term-statistics mean would average a sentinel with
+    # seconds. Reasoning + the measured evidence: SENSOR_TYPES in sensor.py.
     accuracy_decimals: 0
     icon: "mdi:timer-outline"
     web_server:

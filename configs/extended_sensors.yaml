@@ -82,7 +82,9 @@ sensor:
     type: ups_delay_shutdown
     unit_of_measurement: "s"
     device_class: duration
-    state_class: measurement
+    # ⛔ NO state_class, deliberately: this carries a -1 "not set"/"inactive"
+    # sentinel, so a long-term-statistics mean would average a sentinel with
+    # seconds. Reasoning + the measured evidence: SENSOR_TYPES in sensor.py.
     accuracy_decimals: 0
 
   - platform: ups_hid
@@ -92,7 +94,9 @@ sensor:
     type: ups_delay_start
     unit_of_measurement: "s"
     device_class: duration
-    state_class: measurement
+    # ⛔ NO state_class, deliberately: this carries a -1 "not set"/"inactive"
+    # sentinel, so a long-term-statistics mean would average a sentinel with
+    # seconds. Reasoning + the measured evidence: SENSOR_TYPES in sensor.py.
     accuracy_decimals: 0
 
   - platform: ups_hid
@@ -102,7 +106,9 @@ sensor:
     type: ups_delay_reboot
     unit_of_measurement: "s"
     device_class: duration
-    state_class: measurement
+    # ⛔ NO state_class, deliberately: this carries a -1 "not set"/"inactive"
+    # sentinel, so a long-term-statistics mean would average a sentinel with
+    # seconds. Reasoning + the measured evidence: SENSOR_TYPES in sensor.py.
     accuracy_decimals: 0
 
   # Enhanced battery threshold monitoring

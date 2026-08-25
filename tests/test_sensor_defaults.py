@@ -110,6 +110,49 @@ def test_state_class_default_is_mapped_to_enum():
     assert name == "validate_state_class", name
 
 
+def test_config_schema_installs_no_defaults_that_kill_to_code():
+    """sensor_schema() keywords make a key ALWAYS present, killing to_code().
+
+    Every per-type default below is applied by an `if <key> not in config`
+    guard. Passing unit_of_measurement=/device_class=/accuracy_decimals=/
+    state_class= to sensor_schema() installs cv.Optional(key, default=...),
+    so the key survives validation and that guard is permanently False --
+    the per-type value is silently never applied.
+
+    This is not hypothetical: `accuracy_decimals=1` did exactly that, and all
+    24 per-type precisions were dead. Measured in generated code: battery_level
+    emitted set_accuracy_decimals(1) while declaring 0.
+    """
+    tree = _tree()
+    schema = next(
+        n for n in tree.body
+        if isinstance(n, ast.Assign) and n.targets[0].id == "CONFIG_SCHEMA"
+    )
+    calls = [n for n in ast.walk(schema) if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", None) == "sensor_schema"]
+    assert len(calls) == 1, f"expected 1 sensor_schema() call, found {len(calls)}"
+    passed = {kw.arg for kw in calls[0].keywords}
+    forbidden = passed & {
+        "unit_of_measurement", "device_class", "accuracy_decimals", "state_class",
+    }
+    assert not forbidden, (
+        f"sensor_schema() was passed {sorted(forbidden)} -- each installs a "
+        "schema default, which makes the matching `not in config` guard in "
+        "to_code() permanently dead and silently discards the per-type value"
+    )
+
+
+def test_every_type_declares_accuracy_decimals():
+    """The per-type precisions must be a total function over SENSOR_TYPES.
+
+    CONF_TYPE is Required and one_of(SENSOR_TYPES), so with no schema default
+    a type missing accuracy_decimals would get none at all.
+    """
+    types = _sensor_types()
+    missing = [k for k, v in types.items() if "accuracy_decimals" not in v]
+    assert not missing, missing
+
+
 def test_state_class_constants_are_imported():
     imported = {
         alias.name

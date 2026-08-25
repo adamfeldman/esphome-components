@@ -189,9 +189,17 @@ SENSOR_TYPES = {
 }
 
 
+# ⛔ DO NOT pass accuracy_decimals= (or device_class=, unit_of_measurement=,
+# state_class=) to sensor_schema(). Any of those installs
+# cv.Optional(key, default=...), which makes the key ALWAYS present after
+# validation -- and every `if <key> not in config` block in to_code() below is
+# then permanently dead, silently. That is exactly what `accuracy_decimals=1`
+# did: all 24 per-type precisions were ignored and every sensor rendered at one
+# decimal (a battery percentage as "87.0%"). CONF_TYPE is Required and
+# one_of(SENSOR_TYPES), and every entry declares accuracy_decimals, so the
+# per-type values below are a total function -- no sensor can fall through.
 CONFIG_SCHEMA = sensor.sensor_schema(
     UpsHidSensor,
-    accuracy_decimals=1,
 ).extend(
     {
         cv.GenerateID(CONF_UPS_HID_ID): cv.use_id(UpsHidComponent),

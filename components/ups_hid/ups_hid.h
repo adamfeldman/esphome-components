@@ -164,7 +164,35 @@ namespace esphome
       uint32_t last_timer_poll_{0};
       static constexpr uint32_t FAST_POLL_INTERVAL_MS = 2000;  // 2 seconds during countdown
       
-      // Error rate limiting to prevent log spam
+      // *** DEAD CODE -- NEVER CALLED, in this fork or upstream. ***
+      //
+      // Do NOT read this as "USB error logging is rate limited". It is not, anywhere. This
+      // block is a false guardrail; that is the only reason it is still here rather than
+      // deleted, and the comment is the fix for it.
+      //
+      //   * Zero call sites, and that is STRUCTURAL rather than the result of a grep: all
+      //     four names below are private to UpsHidComponent, only ups_hid.cpp defines that
+      //     class's methods, and there are no friend declarations. Nothing else CAN reach them.
+      //   * Inherited, not a regression. psarossy/esphome-components@main carries byte-identical
+      //     code at these same line numbers and is likewise uncalled. There is no commit that
+      //     removed the callers -- do not go looking for one.
+      //   * It was never wired because it cannot reach what it is named for: the USB warnings
+      //     are emitted by Esp32UsbTransport, a DIFFERENT class behind IUsbTransport with no
+      //     back-pointer to the component. Wiring this means fixing that layering first.
+      //
+      // The unthrottled spam path, for whoever picks this up: a CyberPower poll issues ~13
+      // read_hid_report() calls, each able to warn from transport_esp32.cpp (~262/267/271),
+      // plus one each from read_ups_data() and update() => ~15 lines per FAILED poll. It is
+      // unbounded because update()'s READ_FAILED branch never calls mark_failed() -- unlike
+      // the detection branch, which does. That asymmetry is deliberate and correct for a UPS
+      // monitor (it must not stop watching), so do not "fix" it to quiet the log.
+      // Bounded in practice by two things: a clean disconnect is silent (update() returns
+      // early on !is_connected), and the timeout path trips the task watchdog long before 13
+      // timeouts accumulate, so sustained spam needs the fast-fail paths specifically.
+      // Never observed on the fleet as of 2026-08-24.
+      //
+      // Options, deferral rationale and evidence: Home Automation repo,
+      // docs/reference/esphome-ups-monitor.md, "ErrorRateLimit IS DEAD CODE".
       struct ErrorRateLimit {
         uint32_t last_error_time{0};
         uint32_t error_count{0};
@@ -172,8 +200,8 @@ namespace esphome
         static constexpr uint32_t RATE_LIMIT_MS = 5000;  // 5 seconds between repeated errors
         static constexpr uint32_t MAX_BURST = 3;         // Allow 3 errors before rate limiting
       };
-      ErrorRateLimit usb_error_limiter_;
-      ErrorRateLimit protocol_error_limiter_;
+      ErrorRateLimit usb_error_limiter_;       // UNUSED -- see the DEAD CODE note above
+      ErrorRateLimit protocol_error_limiter_;  // UNUSED -- see the DEAD CODE note above
 
       // Clean architecture members
       std::unique_ptr<IUsbTransport> transport_;
@@ -202,7 +230,7 @@ namespace esphome
       bool has_active_timers() const;
       void set_fast_polling_mode(bool enable);
       
-      // Error rate limiting helpers
+      // Error rate limiting helpers -- BOTH UNUSED; see the DEAD CODE note on ErrorRateLimit.
       bool should_log_error(ErrorRateLimit& limiter);
       void log_suppressed_errors(ErrorRateLimit& limiter);
 

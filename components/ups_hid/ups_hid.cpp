@@ -591,7 +591,14 @@ std::string UpsHidComponent::get_protocol_name() const {
 }
 
 
-// Error rate limiting helpers
+// Error rate limiting helpers.
+//
+// *** BOTH FUNCTIONS ARE DEAD -- nothing calls either, here or upstream. ***
+// They are kept only because deleting them silently would leave the next reader with no
+// record of WHY: the limiters they take are private to UpsHidComponent, while the USB
+// warnings they were meant to throttle are emitted by Esp32UsbTransport, a different class.
+// Full reasoning, the spam measurement and the options are on the ErrorRateLimit struct in
+// ups_hid.h. Do not wire these without fixing that layering first.
 bool UpsHidComponent::should_log_error(ErrorRateLimit& limiter) {
   uint32_t now = millis();
   

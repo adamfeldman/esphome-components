@@ -258,8 +258,25 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
                 *data_len = copy_len;
                 
                 ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT success: received %zu bytes", *data_len);
+            } else if (ret != ESP_OK) {
+                // The TRANSFER itself failed -- a genuine USB fault. Keep it at WARN,
+                // and name the actual status instead of the old catch-all wording.
+                ESP_LOGW(ESP32_USB_TAG, "HID GET_REPORT transfer failed: %s", esp_err_to_name(ret));
+                *data_len = 0;
+                ret = ESP_FAIL;
             } else {
-                ESP_LOGW(ESP32_USB_TAG, "HID GET_REPORT: No data received");
+                // Transfer COMPLETED and the device returned an empty payload: it does
+                // not implement this report. Expected and already handled one layer up --
+                // protocol_cyberpower::read_hid_report() logs the same failure at DEBUG,
+                // falls back to an Input report, and returns false as a routine outcome.
+                //
+                // This was ESP_LOGW until 2026-08-25 and it conflated the two cases above
+                // under one message and one level. On a model that omits several optional
+                // reports the benign case fires every poll cycle forever (measured: 24/min
+                // on a CP825 variant), which both drowns the log and makes a REAL fault
+                // indistinguishable from the routine one. Splitting the branch keeps the
+                // genuine faults at WARN rather than silencing the ambiguous value.
+                ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT: device returned no data (report not implemented)");
                 *data_len = 0;
                 ret = ESP_FAIL;
             }

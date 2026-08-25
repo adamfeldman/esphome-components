@@ -233,6 +233,7 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
     transfer->context = ctx;
     transfer->callback = [](usb_transfer_t *t) {
         auto *c = static_cast<TransferCtx *>(t->context);
+        c->status = (int) t->status;
         c->result = (t->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
         c->actual_bytes = t->actual_num_bytes;
         xSemaphoreGive(c->sem);
@@ -259,9 +260,24 @@ esp_err_t Esp32UsbTransport::hid_get_report(uint8_t report_type, uint8_t report_
                 
                 ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT success: received %zu bytes", *data_len);
             } else if (ret != ESP_OK) {
-                // The TRANSFER itself failed -- a genuine USB fault. Keep it at WARN,
-                // and name the actual status instead of the old catch-all wording.
-                ESP_LOGW(ESP32_USB_TAG, "HID GET_REPORT transfer failed: %s", esp_err_to_name(ret));
+                // The transfer did not COMPLETE. Classify on the RAW
+                // usb_transfer_status_t rather than the collapsed esp_err_t: the
+                // GET_DESCRIPTOR(0x2200) path in this same file already learned this
+                // -- "a STALL and a short read are otherwise indistinguishable here"
+                // -- and this path never got the same treatment, so every failure
+                // mode arrived as a bare ESP_FAIL.
+                //
+                // A STALL is the device's STANDARD way of refusing an unsupported
+                // control request. On a model that omits optional reports it is the
+                // EXPECTED answer and arrives every poll cycle forever, so it belongs
+                // at DEBUG beside its sibling below -- not at WARN, where it drowns
+                // the log and makes a real fault indistinguishable from routine.
+                if (ctx->status == USB_TRANSFER_STATUS_STALL) {
+                    ESP_LOGD(ESP32_USB_TAG, "HID GET_REPORT: device STALLed (report not supported)");
+                } else {
+                    ESP_LOGW(ESP32_USB_TAG, "HID GET_REPORT transfer failed: usb_transfer_status=%d",
+                             ctx->status);
+                }
                 *data_len = 0;
                 ret = ESP_FAIL;
             } else {
